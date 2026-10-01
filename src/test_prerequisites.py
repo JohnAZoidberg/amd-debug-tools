@@ -2774,3 +2774,312 @@ class TestPrerequisiteValidator(unittest.TestCase):
         result = self.validator.check_isp4()
         self.assertTrue(result)
         self.mock_db.record_prereq.assert_not_called()
+
+
+class TestIntelPrerequisites(unittest.TestCase):
+    """Test the Intel specific prerequisite checks"""
+
+    @classmethod
+    def setUpClass(cls):
+        logging.basicConfig(filename="/dev/null", level=logging.DEBUG)
+
+    @patch("amd_debug.prerequisites.is_root", return_value=True)
+    @patch("amd_debug.prerequisites.get_kernel_log")
+    @patch("amd_debug.prerequisites.get_distro", return_value="Fedora")
+    @patch("amd_debug.prerequisites.read_file", return_value="mocked_cmdline")
+    @patch("amd_debug.prerequisites.pyudev.Context")
+    @patch("amd_debug.prerequisites.SleepDatabase")
+    def setUp(
+        self,
+        MockSleepDatabase,
+        MockPyudev,
+        _mock_read_file,
+        _mock_get_distro,
+        mock_get_kernel_log,
+        _mock_is_root,
+    ):
+        self.mock_db = MockSleepDatabase.return_value
+        self.mock_pyudev = MockPyudev.return_value
+        self.mock_kernel_log = mock_get_kernel_log.return_value
+        self.validator = PrerequisiteValidator(tool_debug=True)
+
+    def _failure(self, cls):
+        return any(isinstance(f, cls) for f in self.validator.failures)
+
+    @patch("amd_debug.prerequisites.IntelPmcCore")
+    def test_check_intel_pmc_core_bound(self, MockPmc):
+        """Test check_intel_pmc_core with the driver bound"""
+        MockPmc.return_value.available = True
+        MockPmc.return_value.get_param.side_effect = ["N", "Y"]
+        self.mock_pyudev.list_devices.return_value = [MagicMock(sys_name="INT33A1:00")]
+        self.assertTrue(self.validator.check_intel_pmc_core())
+        self.mock_db.record_prereq.assert_called_once_with(
+            "PMC driver `intel_pmc_core` bound to INT33A1:00", "✅"
+        )
+        self.mock_db.record_debug.assert_any_call(
+            "intel_pmc_core warn_on_s0ix_failures: N"
+        )
+        self.mock_db.record_debug.assert_any_call(
+            "intel_pmc_core ltr_ignore_all_suspend: Y"
+        )
+        self.assertFalse(self.validator.failures)
+
+    @patch("amd_debug.prerequisites.IntelPmcCore")
+    def test_check_intel_pmc_core_no_debugfs(self, MockPmc):
+        """Test check_intel_pmc_core when debugfs is unavailable"""
+        MockPmc.return_value.available = False
+        MockPmc.return_value.get_param.return_value = None
+        self.mock_pyudev.list_devices.return_value = [MagicMock(sys_name="INT33A1:00")]
+        self.assertTrue(self.validator.check_intel_pmc_core())
+        self.mock_db.record_prereq.assert_any_call(
+            "intel_pmc_core debugfs not available, S0ix blocker analysis limited",
+            "🚦",
+        )
+
+    def test_check_intel_pmc_core_missing(self):
+        """Test check_intel_pmc_core without the driver"""
+        self.mock_pyudev.list_devices.return_value = []
+        self.assertTrue(self.validator.check_intel_pmc_core())
+        self.assertTrue(self._failure(MissingIntelPmcCore))
+        self.mock_db.record_prereq.assert_called_once_with(
+            "PMC driver `intel_pmc_core` did not bind to any ACPI device", "🚦"
+        )
+
+    @patch("amd_debug.prerequisites.read_file", return_value="intel_idle")
+    def test_check_intel_idle_ok(self, _mock_read_file):
+        """Test check_intel_idle with intel_idle in use"""
+        self.validator.cmdline = "root=/dev/sda1 quiet"
+        self.assertTrue(self.validator.check_intel_idle())
+        self.mock_db.record_prereq.assert_called_once_with(
+            "cpuidle driver `intel_idle` in use", "✅"
+        )
+
+    @patch("amd_debug.prerequisites.read_file", return_value="acpi_idle")
+    def test_check_intel_idle_wrong_driver(self, _mock_read_file):
+        """Test check_intel_idle with acpi_idle in use"""
+        self.validator.cmdline = "root=/dev/sda1 intel_idle.max_cstate=0"
+        self.assertFalse(self.validator.check_intel_idle())
+        self.assertTrue(self._failure(IntelIdleNotUsed))
+        failure = [f for f in self.validator.failures if isinstance(f, IntelIdleNotUsed)][0]
+        self.assertIn("intel_idle.max_cstate=0", str(failure))
+
+    @patch("amd_debug.prerequisites.read_file", return_value="intel_idle")
+    def test_check_intel_idle_limited(self, _mock_read_file):
+        """Test check_intel_idle with a command line limit"""
+        self.validator.cmdline = "processor.max_cstate=1"
+        self.assertFalse(self.validator.check_intel_idle())
+        self.mock_db.record_prereq.assert_called_once_with(
+            "cpuidle driver `intel_idle` limited by processor.max_cstate=1", "❌"
+        )
+
+    @patch("amd_debug.prerequisites.read_file", side_effect=FileNotFoundError)
+    def test_check_intel_idle_no_cpuidle(self, _mock_read_file):
+        """Test check_intel_idle without cpuidle"""
+        self.assertFalse(self.validator.check_intel_idle())
+        self.assertTrue(self._failure(IntelIdleNotUsed))
+
+    @patch("amd_debug.prerequisites.lpit_supported", return_value=True)
+    def test_check_lpit_ok(self, _mock_lpit):
+        """Test check_lpit with LPIT present"""
+        self.assertTrue(self.validator.check_lpit())
+        self.assertFalse(self.validator.failures)
+
+    @patch("amd_debug.prerequisites.lpit_supported", return_value=False)
+    def test_check_lpit_missing(self, _mock_lpit):
+        """Test check_lpit with LPIT missing"""
+        self.assertTrue(self.validator.check_lpit())
+        self.assertTrue(self._failure(MissingLpit))
+        self.mock_db.record_prereq.assert_called_once_with(
+            "ACPI LPIT table missing", "🚦"
+        )
+
+    def test_check_pinctrl_intel(self):
+        """Test check_pinctrl_intel"""
+        self.mock_pyudev.list_devices.return_value = [
+            MagicMock(properties={"DRIVER": "intel-pinctrl"}),
+            MagicMock(properties={"DRIVER": "intel_pmc_core"}),
+            MagicMock(properties={}),
+        ]
+        self.assertTrue(self.validator.check_pinctrl_intel())
+        self.mock_db.record_prereq.assert_called_once_with(
+            "GPIO driver `intel-pinctrl` available", "✅"
+        )
+
+    def test_check_pinctrl_intel_missing(self):
+        """Test check_pinctrl_intel without a driver"""
+        self.mock_pyudev.list_devices.return_value = []
+        self.assertTrue(self.validator.check_pinctrl_intel())
+        self.mock_db.record_prereq.assert_called_once_with(
+            "No Intel GPIO pinctrl driver loaded", "🚦"
+        )
+
+    def test_check_intel_gpu_bound(self):
+        """Test check_intel_gpu with the xe driver bound"""
+        self.mock_pyudev.list_devices.return_value = [
+            MagicMock(
+                properties={
+                    "PCI_CLASS": "30000",
+                    "PCI_ID": "8086B082",
+                    "DRIVER": "xe",
+                    "PCI_SLOT_NAME": "0000:00:02.0",
+                }
+            ),
+            MagicMock(properties={"PCI_CLASS": "30000", "PCI_ID": "10DE1234"}),
+            MagicMock(properties={"PCI_CLASS": "20000", "PCI_ID": "8086AAAA"}),
+        ]
+        self.assertTrue(self.validator.check_intel_gpu())
+        self.mock_db.record_prereq.assert_called_once_with(
+            "GPU driver `xe` bound to 0000:00:02.0", "✅"
+        )
+
+    def test_check_intel_gpu_no_driver(self):
+        """Test check_intel_gpu without a driver"""
+        self.mock_pyudev.list_devices.return_value = [
+            MagicMock(properties={"PCI_CLASS": "30000", "PCI_ID": "8086B082", "DRIVER": None})
+        ]
+        self.assertFalse(self.validator.check_intel_gpu())
+        self.assertTrue(self._failure(MissingIntelGpuDriver))
+
+    def test_check_intel_gpu_missing(self):
+        """Test check_intel_gpu without a GPU"""
+        self.mock_pyudev.list_devices.return_value = []
+        self.assertFalse(self.validator.check_intel_gpu())
+        self.assertTrue(self._failure(MissingGpu))
+
+    @patch("amd_debug.prerequisites.os.path.exists", return_value=True)
+    @patch(
+        "amd_debug.prerequisites.read_file",
+        return_value="fw loaded: yes\npath: i915/xe3lpd_dmc.bin\n",
+    )
+    def test_check_intel_dmc_debugfs_loaded(self, _mock_read_file, _mock_exists):
+        """Test check_intel_dmc with debugfs reporting loaded firmware"""
+        self.assertTrue(self.validator.check_intel_dmc())
+        self.mock_db.record_prereq.assert_called_once_with(
+            "Display DMC firmware loaded", "✅"
+        )
+
+    @patch("amd_debug.prerequisites.os.path.exists", return_value=True)
+    @patch("amd_debug.prerequisites.read_file", return_value="fw loaded: no\n")
+    def test_check_intel_dmc_debugfs_not_loaded(self, _mock_read_file, _mock_exists):
+        """Test check_intel_dmc with debugfs reporting missing firmware"""
+        self.assertFalse(self.validator.check_intel_dmc())
+        self.assertTrue(self._failure(MissingDmcFirmware))
+
+    @patch("amd_debug.prerequisites.os.path.exists", return_value=False)
+    def test_check_intel_dmc_kernel_log_loaded(self, _mock_exists):
+        """Test check_intel_dmc falling back to the kernel log"""
+        self.mock_kernel_log.match_pattern.return_value = (
+            "xe 0000:00:02.0: [drm] Finished loading DMC firmware i915/xe3lpd_dmc.bin (v2.36)"
+        )
+        self.assertTrue(self.validator.check_intel_dmc())
+        self.mock_db.record_prereq.assert_called_once_with(
+            "Display DMC firmware loaded (i915/xe3lpd_dmc.bin)", "✅"
+        )
+
+    @patch("amd_debug.prerequisites.os.path.exists", return_value=False)
+    def test_check_intel_dmc_kernel_log_failed(self, _mock_exists):
+        """Test check_intel_dmc with a firmware load failure in the kernel log"""
+        self.mock_kernel_log.match_pattern.side_effect = [
+            None,
+            "i915 0000:00:02.0: Failed to load DMC firmware i915/foo_dmc.bin",
+        ]
+        self.assertFalse(self.validator.check_intel_dmc())
+        self.assertTrue(self._failure(MissingDmcFirmware))
+
+    @patch("amd_debug.prerequisites.os.path.exists", return_value=False)
+    def test_check_intel_dmc_unknown(self, _mock_exists):
+        """Test check_intel_dmc without any information"""
+        self.mock_kernel_log.match_pattern.return_value = None
+        self.assertTrue(self.validator.check_intel_dmc())
+        self.mock_db.record_prereq.assert_called_once_with(
+            "Unable to determine DMC firmware status", "🚦"
+        )
+
+    @patch("amd_debug.prerequisites.os.path.exists", return_value=False)
+    def test_check_intel_dmc_no_kernel_log(self, _mock_exists):
+        """Test check_intel_dmc without a kernel log"""
+        self.validator.kernel_log = None
+        self.assertTrue(self.validator.check_intel_dmc())
+        self.mock_db.record_prereq.assert_called_once_with(
+            "Unable to test DMC firmware from kernel log", "🚦"
+        )
+
+    def _mock_all_checks(self):
+        methods = [
+            "capture_smbios",
+            "capture_kernel_version",
+            "capture_battery",
+            "capture_linux_firmware",
+            "capture_logind",
+            "capture_pci_acpi",
+            "capture_edid",
+            "capture_nvidia",
+            "capture_cstates",
+            "capture_disabled_pins",
+            "check_aspm",
+            "check_i2c_hid",
+            "check_pcie_hotplug",
+            "check_usb3",
+            "check_usb4",
+            "check_sleep_mode",
+            "check_storage",
+            "check_pinctrl_amd",
+            "check_amd_pmc",
+            "check_amdgpu",
+            "check_pinctrl_intel",
+            "check_intel_pmc_core",
+            "check_intel_idle",
+            "check_lpit",
+            "check_intel_gpu",
+            "check_intel_dmc",
+            "check_fadt",
+            "check_logger",
+            "check_lps0",
+            "check_permissions",
+            "check_wlan",
+            "check_taint",
+            "capture_acpi",
+            "map_acpi_path",
+            "check_device_firmware",
+            "check_network",
+        ]
+        for method in methods:
+            setattr(self.validator, method, MagicMock(return_value=True))
+
+    @patch("amd_debug.prerequisites.clear_temporary_message")
+    @patch("amd_debug.prerequisites.print_temporary_message", return_value=1)
+    def test_run_intel(self, _mock_print, _mock_clear):
+        """Test run() dispatches to the Intel checks"""
+        self._mock_all_checks()
+        self.validator.get_cpu_vendor = MagicMock(return_value="GenuineIntel")
+        self.assertTrue(self.validator.run())
+        for name in [
+            "check_aspm",
+            "check_usb3",
+            "check_sleep_mode",
+            "check_intel_pmc_core",
+            "check_intel_idle",
+            "check_lpit",
+            "check_intel_gpu",
+            "check_intel_dmc",
+            "check_pinctrl_intel",
+            "check_fadt",
+        ]:
+            getattr(self.validator, name).assert_called_once()
+        for name in ["check_amd_pmc", "check_amdgpu", "check_pinctrl_amd", "capture_disabled_pins"]:
+            getattr(self.validator, name).assert_not_called()
+
+    @patch("amd_debug.prerequisites.clear_temporary_message")
+    @patch("amd_debug.prerequisites.print_temporary_message", return_value=1)
+    def test_run_unknown_vendor(self, _mock_print, _mock_clear):
+        """Test run() with an unknown CPU vendor only runs generic checks"""
+        self._mock_all_checks()
+        self.validator.get_cpu_vendor = MagicMock(return_value="HygonGenuine")
+        self.assertTrue(self.validator.run())
+        self.mock_db.record_prereq.assert_any_call(
+            "Unknown CPU vendor 'HygonGenuine', only generic checks will run", "🚦"
+        )
+        self.validator.check_aspm.assert_not_called()
+        self.validator.check_intel_pmc_core.assert_not_called()
+        self.validator.check_amd_pmc.assert_not_called()
+        self.validator.check_fadt.assert_called_once()

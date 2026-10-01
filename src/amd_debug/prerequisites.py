@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 
 """
-This module contains the s0i3 prerequisite validator for amd-debug-tools.
+This module contains the hardware sleep (s0i3 / S0ix) prerequisite validator
+for amd-debug-tools. It supports AMD and Intel platforms.
 """
 
 import configparser
@@ -42,9 +43,12 @@ from amd_debug.common import (
     read_file,
     read_msr,
     AmdTool,
+    VENDOR_AMD,
+    VENDOR_INTEL,
 )
 from amd_debug.battery import Batteries
 from amd_debug.database import SleepDatabase
+from amd_debug.intel import IntelPmcCore, lpit_supported
 from amd_debug.failures import (
     AcpiNvmeStorageD3Enable,
     AmdHsmpBug,
@@ -58,17 +62,22 @@ from amd_debug.failures import (
     DmiNotSetup,
     FadtWrong,
     I2CHidBug,
+    IntelIdleNotUsed,
     KernelRingBufferWrapped,
     LimitedCores,
     MissingAmdCaptureModule,
     MissingAmdgpu,
     MissingAmdgpuFirmware,
     MissingAmdPmc,
+    MissingDmcFirmware,
     MissingGpu,
     MissingDriver,
+    MissingIntelGpuDriver,
+    MissingIntelPmcCore,
     MissingIommuACPI,
     MissingIommuPolicy,
     MissingIsp4PlatformDriver,
+    MissingLpit,
     MissingPcieHotplug,
     MissingThunderbolt,
     MissingXhciHcd,
@@ -440,6 +449,152 @@ class PrerequisiteValidator(AmdTool):
             "PMC driver `amd_pmc` did not bind to any ACPI device", "❌"
         )
         return False
+
+    def check_intel_pmc_core(self):
+        """Check if the intel_pmc_core driver is loaded"""
+        for device in self.pyudev.list_devices(
+            subsystem="platform", DRIVER="intel_pmc_core"
+        ):
+            self.db.record_prereq(
+                f"PMC driver `intel_pmc_core` bound to {device.sys_name}", "✅"
+            )
+            pmc = IntelPmcCore()
+            warn = pmc.get_param("warn_on_s0ix_failures")
+            if warn is not None:
+                self.db.record_debug(f"intel_pmc_core warn_on_s0ix_failures: {warn}")
+            ltr = pmc.get_param("ltr_ignore_all_suspend")
+            if ltr is not None:
+                self.db.record_debug(f"intel_pmc_core ltr_ignore_all_suspend: {ltr}")
+            if not pmc.available:
+                self.db.record_prereq(
+                    "intel_pmc_core debugfs not available, S0ix blocker analysis limited",
+                    "🚦",
+                )
+            return True
+        self.failures += [MissingIntelPmcCore()]
+        self.db.record_prereq(
+            "PMC driver `intel_pmc_core` did not bind to any ACPI device", "🚦"
+        )
+        return True
+
+    def check_intel_idle(self):
+        """Check that intel_idle is the cpuidle driver"""
+        p = os.path.join("/", "sys", "devices", "system", "cpu", "cpuidle", "current_driver")
+        try:
+            driver = read_file(p)
+        except FileNotFoundError:
+            self.db.record_prereq("Kernel doesn't support cpuidle", "❌")
+            self.failures += [IntelIdleNotUsed("none", "")]
+            return False
+        reason = ""
+        for word in self.cmdline.split():
+            if word.startswith(
+                ("intel_idle.max_cstate=", "processor.max_cstate=", "idle=")
+            ):
+                reason = word
+                break
+        if driver != "intel_idle":
+            self.db.record_prereq(f"cpuidle driver `{driver}` in use", "❌")
+            self.failures += [IntelIdleNotUsed(driver, reason)]
+            return False
+        if reason:
+            self.db.record_prereq(
+                f"cpuidle driver `intel_idle` limited by {reason}", "❌"
+            )
+            self.failures += [IntelIdleNotUsed(driver, reason)]
+            return False
+        self.db.record_prereq("cpuidle driver `intel_idle` in use", "✅")
+        return True
+
+    def check_lpit(self):
+        """Check the ACPI LPIT table exposes residency counters"""
+        if lpit_supported():
+            self.db.record_prereq("ACPI LPIT provides S0ix residency counters", "✅")
+            return True
+        self.db.record_prereq("ACPI LPIT table missing", "🚦")
+        self.failures += [MissingLpit()]
+        return True
+
+    def check_pinctrl_intel(self):
+        """Check that the Intel GPIO controllers have a pinctrl driver"""
+        drivers = set()
+        for device in self.pyudev.list_devices(subsystem="platform"):
+            driver = device.properties.get("DRIVER")
+            if driver and driver.endswith("pinctrl"):
+                drivers.add(driver)
+        if drivers:
+            self.db.record_prereq(
+                f"GPIO driver `{'`, `'.join(sorted(drivers))}` available", "✅"
+            )
+        else:
+            self.db.record_prereq("No Intel GPIO pinctrl driver loaded", "🚦")
+        return True
+
+    def check_intel_gpu(self):
+        """Check for the Intel graphics driver"""
+        count = 0
+        for device in self.pyudev.list_devices(subsystem="pci"):
+            klass = device.properties.get("PCI_CLASS")
+            if klass not in ["30000", "38000"]:
+                continue
+            pci_id = device.properties.get("PCI_ID")
+            if not pci_id.startswith("8086"):
+                continue
+            count += 1
+            driver = device.properties.get("DRIVER")
+            if driver not in ["i915", "xe"]:
+                self.db.record_prereq("Intel GPU driver `i915`/`xe` not loaded", "❌")
+                self.failures += [MissingIntelGpuDriver()]
+                return False
+            slot = device.properties.get("PCI_SLOT_NAME")
+            self.db.record_prereq(f"GPU driver `{driver}` bound to {slot}", "✅")
+        if count == 0:
+            self.db.record_prereq("Integrated GPU not found", "❌")
+            self.failures += [MissingGpu()]
+            return False
+        return True
+
+    def check_intel_dmc(self):
+        """Check the Intel display DMC firmware loaded"""
+        # debugfs has the authoritative answer (shared by i915 and xe)
+        for num in range(0, 2):
+            p = os.path.join(
+                "/", "sys", "kernel", "debug", "dri", f"{num}", "i915_dmc_info"
+            )
+            if not os.path.exists(p):
+                continue
+            try:
+                contents = read_file(p)
+            except PermissionError:
+                break
+            self.db.record_debug(apply_prefix_wrapper("DMC info:", contents))
+            for line in contents.split("\n"):
+                if not line.startswith("fw loaded"):
+                    continue
+                if "yes" in line:
+                    self.db.record_prereq("Display DMC firmware loaded", "✅")
+                    return True
+                self.db.record_prereq("Display DMC firmware not loaded", "❌")
+                self.failures += [MissingDmcFirmware([])]
+                return False
+        if not self.kernel_log:
+            self.db.record_prereq("Unable to test DMC firmware from kernel log", "🚦")
+            return True
+        self.kernel_log.seek()
+        match = self.kernel_log.match_pattern("Finished loading DMC firmware")
+        if match:
+            self.db.record_prereq(f"Display DMC firmware loaded ({match.split()[-2]})", "✅")
+            return True
+        self.kernel_log.seek()
+        match = self.kernel_log.match_pattern(
+            "Failed to load DMC firmware|Direct firmware load for i915/.*dmc.*failed"
+        )
+        if match:
+            self.db.record_prereq("Display DMC firmware failed to load", "❌")
+            self.failures += [MissingDmcFirmware([match])]
+            return False
+        self.db.record_prereq("Unable to determine DMC firmware status", "🚦")
+        return True
 
     def check_wlan(self):
         """Checks for WLAN device"""
@@ -1413,24 +1568,28 @@ class PrerequisiteValidator(AmdTool):
         checks = []
 
         vendor = self.get_cpu_vendor()
-        if vendor == "AuthenticAMD":
+        # checks that apply to any x86 SoC supporting low power idle
+        x86_checks = [
+            self.check_aspm,
+            self.check_i2c_hid,
+            self.check_pcie_hotplug,
+            self.check_usb3,
+            self.check_usb4,
+            self.check_sleep_mode,
+            self.check_storage,
+        ]
+        if vendor == VENDOR_AMD:
             info += [
                 self.capture_disabled_pins,
             ]
+            checks += x86_checks
             checks += [
-                self.check_aspm,
-                self.check_i2c_hid,
                 self.check_pinctrl_amd,
                 self.check_amd_hsmp,
                 self.check_amd_xdna,
                 self.check_amd_pmc,
                 self.check_amd_cpu_hpet_wa,
                 self.check_port_pm_override,
-                self.check_pcie_hotplug,
-                self.check_usb3,
-                self.check_usb4,
-                self.check_sleep_mode,
-                self.check_storage,
                 self.check_wcn6855_bug,
                 self.check_amdgpu,
                 self.check_amdgpu_parameters,
@@ -1442,6 +1601,20 @@ class PrerequisiteValidator(AmdTool):
                 self.check_dpia_pg_dmcub,
                 self.check_isp4,
             ]
+        elif vendor == VENDOR_INTEL:
+            checks += x86_checks
+            checks += [
+                self.check_pinctrl_intel,
+                self.check_intel_pmc_core,
+                self.check_intel_idle,
+                self.check_lpit,
+                self.check_intel_gpu,
+                self.check_intel_dmc,
+            ]
+        else:
+            self.db.record_prereq(
+                f"Unknown CPU vendor '{vendor}', only generic checks will run", "🚦"
+            )
 
         checks += [
             self.check_fadt,

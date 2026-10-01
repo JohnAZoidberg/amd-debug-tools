@@ -144,3 +144,38 @@ class TestFailures(unittest.TestCase):
                 call(failure),
             ]
         )
+
+
+class TestIntelFailures(unittest.TestCase):
+    """Test the Intel specific failure classes"""
+
+    def test_intel_failures(self):
+        """Test descriptions and explanations"""
+        cls = amd_debug.failures.MissingIntelPmcCore()
+        self.assertEqual(cls.get_description(), "intel_pmc_core driver is missing")
+        cls = amd_debug.failures.MissingIntelGpuDriver()
+        self.assertEqual(cls.get_description(), "Intel graphics driver is missing")
+        cls = amd_debug.failures.MissingDmcFirmware(["boom"])
+        self.assertEqual(
+            cls.get_description(), "Intel display DMC firmware is not loaded"
+        )
+        self.assertIn("boom", str(cls))
+        cls = amd_debug.failures.IntelIdleNotUsed("acpi_idle", "idle=halt")
+        self.assertEqual(
+            cls.get_description(), "cpuidle driver is 'acpi_idle' instead of intel_idle"
+        )
+        self.assertIn("idle=halt", str(cls))
+        cls = amd_debug.failures.IntelIdleNotUsed("none", "")
+        self.assertIn("CONFIG_INTEL_IDLE", str(cls))
+        cls = amd_debug.failures.MissingLpit()
+        self.assertEqual(cls.get_description(), "ACPI LPIT table is missing")
+        cls = amd_debug.failures.NoPackageC10({"Package C2": 5})
+        self.assertEqual(
+            cls.get_description(), "CPU package did not reach PC10 during suspend"
+        )
+        self.assertIn("Package C2: 5", str(cls))
+        cls = amd_debug.failures.S0ixBlocked("S0i2.0", ["XHCI_D3"], "c10")
+        self.assertEqual(cls.get_description(), "SoC did not enter S0i2.0")
+        self.assertIn("XHCI_D3", str(cls))
+        cls = amd_debug.failures.S0ixBlocked("S0i2.0", [], "c10")
+        self.assertIn("No blocker was reported", str(cls))

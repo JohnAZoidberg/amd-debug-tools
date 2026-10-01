@@ -273,9 +273,10 @@ class SleepModeWrong(S0i3Failure):
             "The system hasn't been configured for Modern Standby in BIOS setup"
         )
         self.explanation = (
-            "AMD systems must be configured for Modern Standby in BIOS setup "
+            "The system must be configured for Modern Standby in BIOS setup "
             "for s2idle to function properly in Linux. "
-            "On some OEM systems this is referred to as 'Windows' sleep mode. "
+            "On some OEM systems this is referred to as 'Windows' sleep mode "
+            "or 'Low Power S0 Idle'. "
             "If the BIOS is configured for S3 and you manually select s2idle "
             "in /sys/power/mem_sleep, the system will not enter the deepest hardware state."
         )
@@ -290,7 +291,8 @@ class DeepSleep(S0i3Failure):
             "The kernel command line is asserting the system to use deep sleep"
         )
         self.explanation = (
-            "Adding mem_sleep_default=deep doesn't work on AMD systems. "
+            "Adding mem_sleep_default=deep forces S3 suspend, which is not the "
+            "hardware sleep state that this tool validates. "
             "Please remove it from the kernel command line."
         )
 
@@ -665,3 +667,140 @@ class NpuIommu(S0i3Failure):
             "The NPU requires a properly configured IOMMU to function correctly. "
             "Ensure that the IOMMU is enabled and configured in the BIOS."
         )
+
+
+class MissingIntelPmcCore(S0i3Failure):
+    """intel_pmc_core driver is missing"""
+
+    def __init__(self):
+        super().__init__()
+        self.description = "intel_pmc_core driver is missing"
+        self.explanation = (
+            "The intel_pmc_core driver exposes the S0ix residency counters and "
+            "the substate requirement status used to find S0ix blockers. "
+            "Without it the hardware sleep analysis will be incomplete. "
+            "Be sure that you have enabled CONFIG_INTEL_PMC_CORE in your kernel. "
+            "If it is enabled but the driver isn't binding to the INT33A1 "
+            "ACPI device then you may have found a bug and should report it."
+        )
+
+
+class MissingIntelGpuDriver(S0i3Failure):
+    """Intel graphics driver is missing"""
+
+    def __init__(self):
+        super().__init__()
+        self.description = "Intel graphics driver is missing"
+        self.explanation = (
+            "The i915 or xe driver is required for the integrated display "
+            "engine to enter its deepest power states (DC9). Without the "
+            "display in a low power state the package can't reach PC10 and "
+            "the SoC can't reach S0ix. "
+            "Be sure that you have enabled CONFIG_DRM_I915 or CONFIG_DRM_XE in your kernel."
+        )
+
+
+class MissingDmcFirmware(S0i3Failure):
+    """Intel display DMC firmware isn't loaded"""
+
+    def __init__(self, errors):
+        super().__init__()
+        self.description = "Intel display DMC firmware is not loaded"
+        self.explanation = (
+            "The Display Microcontroller (DMC) firmware is required for the "
+            "display engine to enter DC5/DC6/DC9 power states. Without it the "
+            "package can't enter PC10 and the SoC can't reach S0ix. "
+            "Install the latest linux-firmware snapshot (the files live in "
+            "/lib/firmware/i915) and make sure it is included in your initramfs."
+        )
+        self.url = "https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/tree/i915"
+        for error in errors:
+            self.explanation += f"{error}"
+
+
+class IntelIdleNotUsed(S0i3Failure):
+    """intel_idle isn't the cpuidle driver"""
+
+    def __init__(self, driver, reason):
+        super().__init__()
+        self.description = f"cpuidle driver is '{driver}' instead of intel_idle"
+        self.explanation = (
+            "The intel_idle driver is required to enter the deepest core "
+            "C-states. Without them the package can't reach PC10, which "
+            "is a prerequisite for S0ix. "
+        )
+        if reason:
+            self.explanation += (
+                f"The kernel command line contains '{reason}' which disables "
+                "or limits it. Please remove it. "
+            )
+        else:
+            self.explanation += (
+                "Be sure that you have enabled CONFIG_INTEL_IDLE in your kernel "
+                "and that the platform is supported by it."
+            )
+
+
+class MissingLpit(S0i3Failure):
+    """ACPI LPIT table is missing"""
+
+    def __init__(self):
+        super().__init__()
+        self.description = "ACPI LPIT table is missing"
+        self.explanation = (
+            "The Low Power Idle Table (LPIT) describes where the firmware "
+            "exposes the PC10 and S0ix residency counters. Without it the "
+            "kernel can't report how long the system spent in hardware sleep. "
+            "This is a BIOS bug that should be reported to the system vendor."
+        )
+
+
+class NoPackageC10(S0i3Failure):
+    """Package didn't enter PC10"""
+
+    def __init__(self, cstates):
+        super().__init__()
+        self.description = "CPU package did not reach PC10 during suspend"
+        self.explanation = (
+            "Entering S0ix requires the CPU package to first reach the PC10 "
+            "package C-state. Common blockers are a device that is not in a "
+            "low power (D3) state, a PCIe link that is not in L1.2/L2, a device "
+            "reporting a too aggressive LTR value, or the display engine not "
+            "entering DC9 (check DMC firmware). "
+            "The 'pch_ip_power_gating_status' and 'ltr_show' data in the debug "
+            "section of the report may help identify the blocker. "
+        )
+        if cstates:
+            summary = ", ".join(f"{k}: {v}" for k, v in cstates.items())
+            self.explanation += f"Package C-state counter deltas: {summary}"
+
+
+class S0ixBlocked(S0i3Failure):
+    """Package reached PC10 but SoC didn't enter S0ix"""
+
+    def __init__(self, mode, blockers, latch, method=""):
+        super().__init__()
+        self.description = f"SoC did not enter {mode}"
+        self.explanation = (
+            f"The CPU package reached PC10, but the SoC didn't enter the {mode} "
+            "S0ix substate. intel_pmc_core reports which IP blocks are "
+            "required to be idle for each substate. "
+        )
+        if blockers:
+            if method == "blocker counter advanced during the cycle":
+                how = "their S0ix blocker counter advanced during the cycle"
+            else:
+                how = f"status latched on {latch} entry"
+            self.explanation += (
+                f"The following IPs were required for {mode} but were not idle "
+                f"({how}): {', '.join(blockers)}. "
+                "Look for the driver that owns each IP and check that it enters "
+                "runtime suspend / D3 before s2idle."
+            )
+        else:
+            self.explanation += (
+                "No blocker was reported by substate_requirements; check the "
+                "substate_status_registers data in the report debug section or "
+                "report a bug with the report attached."
+            )
+        self.url = "https://web.archive.org/web/20230614200306/https://01.org/blogs/qwang59/2020/linux-s0ix-troubleshooting"
