@@ -538,3 +538,55 @@ class TestWakeIRQ(unittest.TestCase):
         self.assertEqual(str(irq), "Foo (bar)")
         irq.actions = ""
         self.assertEqual(str(irq), "Foo")
+
+
+class TestWakeIRQIntel(unittest.TestCase):
+    """Test WakeIRQ naming on Intel platforms"""
+
+    @classmethod
+    def setUpClass(cls):
+        logging.basicConfig(filename="/dev/null", level=logging.DEBUG)
+
+    @patch("amd_debug.wake.read_file")
+    @patch("os.path.exists", return_value=False)
+    def test_intel_gpio_chip(self, _mock_exists, mock_read_file):
+        """An intel-gpio chip IRQ is named after the GPIO line"""
+        mock_read_file.side_effect = lambda path: {
+            "/sys/kernel/irq/163/chip_name": "intel-gpio",
+            "/sys/kernel/irq/163/actions": "PIXA3854:00",
+            "/sys/kernel/irq/163/wakeup": "enabled",
+            "/sys/kernel/irq/163/hwirq": "42",
+        }.get(path, "")
+        irq = WakeIRQ(163, MagicMock())
+        self.assertEqual(irq.name, "GPIO 42")
+        self.assertEqual(str(irq), "GPIO 42 (PIXA3854:00)")
+
+    @patch("amd_debug.wake.read_file")
+    @patch("os.readlink")
+    @patch("os.path.exists", return_value=False)
+    def test_intel_pinctrl_controller(self, _mock_exists, mock_readlink, mock_read_file):
+        """The shared Intel GPIO controller IRQ is recognized via its pinctrl driver"""
+        mock_read_file.side_effect = lambda path: {
+            "/sys/kernel/irq/14/chip_name": "IR-IO-APIC",
+            "/sys/kernel/irq/14/actions": "INTC10BC:00,INTC10BC:01",
+            "/sys/kernel/irq/14/wakeup": "enabled",
+        }.get(path, "")
+        mock_readlink.return_value = "../../../bus/platform/drivers/intel-pinctrl"
+        irq = WakeIRQ(14, MagicMock())
+        self.assertEqual(irq.name, "GPIO Controller")
+        self.assertEqual(str(irq), "GPIO Controller")
+
+    @patch("amd_debug.wake.read_file")
+    @patch("os.readlink", side_effect=OSError)
+    @patch("os.path.exists", return_value=False)
+    def test_unknown_apic_actions(self, _mock_exists, _mock_readlink, mock_read_file):
+        """Unrelated legacy IRQs are left unnamed"""
+        mock_read_file.side_effect = lambda path: {
+            "/sys/kernel/irq/20/chip_name": "IR-IO-APIC",
+            "/sys/kernel/irq/20/actions": "idma64.5,i801_smbus",
+            "/sys/kernel/irq/20/wakeup": "disabled",
+        }.get(path, "")
+        irq = WakeIRQ(20, MagicMock())
+        self.assertEqual(irq.name, "Disabled interrupt")
+        self.assertFalse(WakeIRQ._is_pinctrl_device(""))
+        self.assertFalse(WakeIRQ._is_pinctrl_device(".."))

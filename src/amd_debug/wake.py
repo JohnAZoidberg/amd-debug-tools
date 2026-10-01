@@ -40,8 +40,8 @@ class WakeIRQ:
         except (PermissionError, FileNotFoundError):
             wakeup = ""
 
-        # This is an IRQ tied to _AEI
-        if self.chip_name == "amd_gpio":
+        # This is an IRQ tied to _AEI (AMD: amd_gpio, Intel: intel-gpio)
+        if self.chip_name in ["amd_gpio", "intel-gpio"]:
             try:
                 hw_gpio = read_file(os.path.join(p, "hwirq"))
                 self.name = f"GPIO {hw_gpio}"
@@ -59,6 +59,8 @@ class WakeIRQ:
                 self.name = "RTC"
             elif self.actions == "timer":
                 self.name = "Timer"
+            elif self._is_pinctrl_device(self.actions):
+                self.name = "GPIO Controller"
             self.actions = ""
         elif "PCI-MSI" in self.chip_name:
             bdf = self.chip_name.split("-")[-1]
@@ -114,6 +116,29 @@ class WakeIRQ:
         # check if it's disabled
         if not self.name and wakeup == "disabled":
             self.name = "Disabled interrupt"
+
+    @staticmethod
+    def _is_pinctrl_device(actions) -> bool:
+        """Check if the IRQ actions name platform devices bound to a pinctrl driver
+
+        Intel GPIO controllers share one IRQ line, so the actions look like
+        "INTC10BC:00,INTC10BC:01,..." and each is a platform device bound to
+        a driver such as "intel-pinctrl" or "tigerlake-pinctrl".
+        """
+        if not actions:
+            return False
+        for comp in actions.split(","):
+            comp = os.path.basename(comp.strip())
+            if not comp or comp in (".", ".."):
+                return False
+            t = os.path.join("/", "sys", "bus", "platform", "devices", comp, "driver")
+            try:
+                driver = os.path.basename(os.readlink(t))
+            except OSError:
+                return False
+            if not driver.endswith("pinctrl"):
+                return False
+        return True
 
     def __str__(self):
         actions = f" ({self.actions})" if self.actions else ""
