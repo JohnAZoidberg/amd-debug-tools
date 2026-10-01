@@ -9,3 +9,5 @@ amd*.md
 deb_dist/
 *.tar.gz
 .coverage
+.venv/
+uv.lock
