@@ -587,3 +587,45 @@ class TestCommon(unittest.TestCase):
         with patch("builtins.__import__", side_effect=mock_import):
             result = reboot()
             self.assertFalse(result)
+
+
+class TestCpuVendor(unittest.TestCase):
+    """Test CPU vendor detection"""
+
+    @classmethod
+    def setUpClass(cls):
+        logging.basicConfig(filename="/dev/null", level=logging.DEBUG)
+
+    @patch(
+        "amd_debug.common.read_file",
+        return_value="processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\n",
+    )
+    def test_get_cpu_vendor_intel(self, _mock_read_file):
+        """Test reading an Intel vendor string"""
+        from amd_debug.common import get_cpu_vendor, VENDOR_INTEL
+
+        self.assertEqual(get_cpu_vendor(), VENDOR_INTEL)
+
+    @patch(
+        "amd_debug.common.read_file",
+        return_value="processor\t: 0\nvendor_id\t: AuthenticAMD\n",
+    )
+    def test_get_cpu_vendor_amd(self, _mock_read_file):
+        """Test reading an AMD vendor string"""
+        from amd_debug.common import get_cpu_vendor, VENDOR_AMD
+
+        self.assertEqual(get_cpu_vendor(), VENDOR_AMD)
+
+    @patch("amd_debug.common.read_file", return_value="processor\t: 0\n")
+    def test_get_cpu_vendor_missing(self, _mock_read_file):
+        """Test a cpuinfo without a vendor_id"""
+        from amd_debug.common import get_cpu_vendor
+
+        self.assertEqual(get_cpu_vendor(), "")
+
+    @patch("amd_debug.common.read_file", side_effect=FileNotFoundError)
+    def test_get_cpu_vendor_unreadable(self, _mock_read_file):
+        """Test an unreadable cpuinfo"""
+        from amd_debug.common import get_cpu_vendor
+
+        self.assertEqual(get_cpu_vendor(), "")

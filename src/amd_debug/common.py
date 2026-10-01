@@ -327,6 +327,23 @@ def is_root() -> bool:
     return os.geteuid() == 0
 
 
+VENDOR_AMD = "AuthenticAMD"
+VENDOR_INTEL = "GenuineIntel"
+
+
+def get_cpu_vendor() -> str:
+    """Get the CPU vendor string from /proc/cpuinfo"""
+    p = os.path.join("/", "proc", "cpuinfo")
+    try:
+        cpu = read_file(p)
+    except (FileNotFoundError, PermissionError):
+        return ""
+    for line in cpu.split("\n"):
+        if line.startswith("vendor_id"):
+            return line.split(":")[-1].strip()
+    return ""
+
+
 def BIT(num):  # pylint: disable=invalid-name
     """Return a bit shifted value"""
     return 1 << num
