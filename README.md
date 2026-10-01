@@ -3,6 +3,8 @@
 [![PyPI](https://img.shields.io/pypi/v/amd-debug-tools.svg)](https://pypi.org/project/amd-debug-tools/)
 
 This repository hosts open tools that are useful for debugging issues on AMD systems.
+The `amd-s2idle` tool additionally supports Intel systems for analyzing
+s2idle / S0ix problems.
 
 ## Installation
 ### Distro (Arch)

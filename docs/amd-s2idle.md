@@ -10,6 +10,33 @@ For analysis of power consumption issues it can be hooked into `systemd` to
 run a command to capture data right before and after the system enters and
 exits the s2idle state.
 
+## Supported platforms
+The tool detects the CPU vendor and runs a set of generic checks on any
+x86 system (ASPM policy, USB3/USB4 drivers, PCIe hotplug, storage DevSlp,
+I2C HID devices, FADT low power idle flag, LPS0 `_DSM`, sleep mode, ...)
+plus a vendor specific set:
+
+* **AMD** (Zen based SoCs): `amd_pmc`, `amdgpu`, `pinctrl_amd`, IOMMU, SMT,
+  MSR and CPU topology checks. Hardware sleep residency comes from
+  `/sys/power/suspend_stats/last_hw_sleep` or the `amd_pmc` debugfs.
+* **Intel** (Core / Core Ultra SoCs): `intel_pmc_core`, `intel_idle`, the
+  `i915`/`xe` driver and its DMC firmware, the ACPI LPIT table and the
+  pinctrl driver for the GPIO controllers. During every cycle the tool records
+  the package C10 and S0ix residency from the LPIT counters, the per substate
+  (`S0i2.0`, `S0i2.1`, ...) residency from `intel_pmc_core`, and when the SoC
+  did not reach S0ix it lists the IP blocks that `intel_pmc_core` reports as
+  not idle (`substate_requirements`). On SoCs with S0ix blocker counters
+  (Lunar Lake and later) that table holds a cumulative per IP counter instead
+  of a latched status, so the tool snapshots the counters before suspend and
+  reports the IPs whose counter advanced during the cycle; without a snapshot
+  it falls back to the latched `substate_status_registers` bits. The
+  `pch_ip_power_gating_status` and `ltr_show` data are stored in the debug
+  section of the report.
+  The `warn_on_s0ix_failures` module parameter of `intel_pmc_core` is enabled
+  for the duration of a cycle so the kernel logs the S0ix blocker registers.
+  Most of this requires `debugfs` to be accessible, so kernel lockdown
+  (Secure Boot) limits the analysis to the LPIT counters.
+
 4 high level commands are supported.
 
 ## `amd-s2idle install`
