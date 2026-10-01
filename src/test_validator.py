@@ -20,6 +20,7 @@ from amd_debug.validator import (
     SleepValidator,
     toggle_pm_debug,
 )
+from amd_debug.failures import NoPackageC10, S0ixBlocked
 
 
 class TestValidatorHelpers(unittest.TestCase):
@@ -76,9 +77,10 @@ class TestValidator(unittest.TestCase):
     def setUpClass(cls):
         logging.basicConfig(filename="/dev/null", level=logging.DEBUG)
 
+    @patch("amd_debug.validator.get_cpu_vendor", return_value="AuthenticAMD")
     @patch("amd_debug.validator.SleepDatabase")
     @patch("subprocess.run")
-    def setUp(self, _db_mock, _mock_run):
+    def setUp(self, _db_mock, _mock_run, _mock_vendor):
         """Set up a mock context for testing"""
         self.validator = SleepValidator(tool_debug=True, bios_debug=False)
 
@@ -1202,3 +1204,410 @@ class TestValidator(unittest.TestCase):
             mock_start_cycle.assert_called_once()
             mock_post.assert_called_once()
             mock_sync.assert_called_once()
+
+
+class TestIntelValidator(unittest.TestCase):
+    """Test the Intel specific sleep validator behaviour"""
+
+    REQUIREMENTS = (
+        "                       Element |    S0i2.0 |    S0i2.1 |    Status |\n"
+        "                       XHCI_D3 |  Required |  Required |           |\n"
+        "                       SATA_D3 |           |  Required |       Yes |\n"
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        logging.basicConfig(filename="/dev/null", level=logging.DEBUG)
+
+    @patch("amd_debug.validator.get_cpu_vendor", return_value="GenuineIntel")
+    @patch("amd_debug.validator.SleepDatabase")
+    @patch("subprocess.run")
+    def setUp(self, _db_mock, _mock_run, _mock_vendor):
+        """Set up a mock context for testing"""
+        self.validator = SleepValidator(tool_debug=True, bios_debug=False)
+        self.validator.intel = MagicMock()
+        self.validator.intel.available = True
+
+    def _state(self, **overrides):
+        state = {
+            "lpit": {"cpu": 1000, "system": 2000},
+            "substates": {"S0i2.0": 10, "S0i2.1": 20},
+            "pkgc": {"Package C10": 100},
+            "requirements": {},
+            "latch": "c10",
+            "warn_orig": "N",
+        }
+        state.update(overrides)
+        return state
+
+    def test_capture_hw_sleep_lpit_fallback(self):
+        """suspend_stats reports 0, the LPIT counter delta is used instead"""
+        self.validator.lpit_delta = {"system": 2500000}
+        with patch("os.path.exists", return_value=True), patch(
+            "amd_debug.validator.read_file", return_value="0"
+        ), patch.object(self.validator.db, "record_cycle_data") as mock_cycle_data:
+            self.assertTrue(self.validator.capture_hw_sleep())
+            self.assertEqual(self.validator.hw_sleep_duration, 2.5)
+            mock_cycle_data.assert_not_called()
+
+    def test_capture_hw_sleep_no_s0ix(self):
+        """Neither suspend_stats nor LPIT show any residency"""
+        self.validator.lpit_delta = {"system": 0}
+        with patch("os.path.exists", return_value=True), patch(
+            "amd_debug.validator.read_file", return_value="0"
+        ), patch.object(self.validator.db, "record_cycle_data") as mock_cycle_data:
+            self.assertFalse(self.validator.capture_hw_sleep())
+            mock_cycle_data.assert_called_once_with(
+                "Did not reach hardware sleep state", "❌"
+            )
+
+    def test_capture_hw_sleep_prefers_suspend_stats(self):
+        """A non-zero suspend_stats value wins over the LPIT counter"""
+        self.validator.lpit_delta = {"system": 2500000}
+        with patch("os.path.exists", return_value=True), patch(
+            "amd_debug.validator.read_file", return_value="3000000"
+        ):
+            self.assertTrue(self.validator.capture_hw_sleep())
+            self.assertEqual(self.validator.hw_sleep_duration, 3.0)
+
+    @patch("amd_debug.validator.save_cycle_state")
+    def test_capture_intel_pre_non_intel(self, mock_save):
+        """Nothing happens on non Intel systems"""
+        self.validator.cpu_vendor = "AuthenticAMD"
+        with patch.object(self.validator.db, "record_debug") as mock_debug:
+            self.validator.capture_intel_pre()
+            self.validator.capture_intel_post()
+            mock_debug.assert_not_called()
+        mock_save.assert_not_called()
+        self.assertEqual(self.validator.intel_state, {})
+
+    @patch("amd_debug.validator.save_cycle_state")
+    @patch("amd_debug.validator.read_lpit_residency", return_value={"cpu": 1, "system": 2})
+    def test_capture_intel_pre(self, _mock_lpit, mock_save):
+        """Snapshots are taken, the latch is armed and the warning enabled"""
+        self.validator.intel.substate_residencies.return_value = {"S0i2.0": 5}
+        self.validator.intel.package_cstates.return_value = {"Package C10": 7}
+        self.validator.intel.latch_mode.return_value = True
+        self.validator.intel.get_param.return_value = "N"
+        self.validator.intel.set_param.return_value = True
+        with patch.object(self.validator.db, "record_debug") as mock_debug:
+            self.validator.capture_intel_pre()
+            mock_debug.assert_called_once_with(
+                "Latching S0ix substate requirements on c10 entry"
+            )
+        expected = {
+            "lpit": {"cpu": 1, "system": 2},
+            "substates": {"S0i2.0": 5},
+            "pkgc": {"Package C10": 7},
+            "requirements": {},
+            "latch": "c10",
+            "warn_orig": "N",
+        }
+        self.assertEqual(self.validator.intel_state, expected)
+        mock_save.assert_called_once_with(expected)
+        self.validator.intel.latch_mode.assert_called_once_with("c10")
+        self.validator.intel.set_param.assert_called_once_with(
+            "warn_on_s0ix_failures", "Y"
+        )
+
+    @patch("amd_debug.validator.save_cycle_state")
+    @patch("amd_debug.validator.read_lpit_residency", return_value={})
+    def test_capture_intel_pre_latches_deepest(self, _mock_lpit, _mock_save):
+        """The latch follows the deepest substate reached in the previous cycle"""
+        self.validator.intel_deepest = "S0i2.0"
+        self.validator.intel.latch_mode.return_value = False
+        self.validator.intel.get_param.return_value = "Y"
+        self.validator.capture_intel_pre()
+        self.validator.intel.latch_mode.assert_called_once_with("S0i2.0")
+        self.assertEqual(self.validator.intel_state["latch"], "")
+        self.assertIsNone(self.validator.intel_state["warn_orig"])
+        self.validator.intel.set_param.assert_not_called()
+
+    @patch("amd_debug.validator.save_cycle_state")
+    @patch("amd_debug.validator.read_lpit_residency", return_value={})
+    def test_capture_intel_pre_no_debugfs(self, _mock_lpit, _mock_save):
+        """Lockdown or missing debugfs is reported"""
+        self.validator.intel.available = False
+        self.validator.intel.get_param.return_value = None
+        self.validator.lockdown = "integrity"
+        with patch.object(self.validator.db, "record_debug") as mock_debug:
+            self.validator.capture_intel_pre()
+            mock_debug.assert_called_once_with(
+                "intel_pmc_core debugfs not available, S0ix substate analysis "
+                "disabled (kernel lockdown)"
+            )
+        self.validator.intel.latch_mode.assert_not_called()
+
+    @patch("amd_debug.validator.read_lpit_residency")
+    def test_capture_intel_post_blocked(self, mock_lpit):
+        """PC10 reached but no S0ix: blockers are reported"""
+        self.validator.intel_state = self._state()
+        self.validator.kernel_duration = 5
+        mock_lpit.return_value = {"cpu": 1000 + 4000000, "system": 2000}
+        self.validator.intel.substate_residencies.return_value = {
+            "S0i2.0": 10,
+            "S0i2.1": 20,
+        }
+        self.validator.intel.package_cstates.return_value = {"Package C10": 150}
+        reads = {
+            "substate_requirements": self.REQUIREMENTS,
+            "pch_ip_power_gating_status": "PCH IP: On",
+            "ltr_show": "IP0 LTR",
+            "substate_status_registers": "regs",
+        }
+        self.validator.intel.read.side_effect = lambda name: reads.get(name)
+        with patch.object(
+            self.validator.db, "record_cycle_data"
+        ) as mock_cycle_data, patch.object(
+            self.validator.db, "record_debug"
+        ) as mock_debug:
+            self.validator.capture_intel_post()
+            mock_cycle_data.assert_any_call(
+                "Package C10 residency 0:00:04 (80.00% of kernel suspend)", "💤"
+            )
+            mock_cycle_data.assert_any_call(
+                "S0ix substate residency: S0i2.0 0:00:00, S0i2.1 0:00:00", "❌"
+            )
+            mock_cycle_data.assert_any_call("IPs blocking S0i2.0: XHCI_D3", "❌")
+            mock_debug.assert_any_call("Package C-state counter deltas: Package C10 50")
+            debug_messages = [c.args[0] for c in mock_debug.call_args_list]
+            self.assertTrue(any("pmc_core ltr_show:" in m for m in debug_messages))
+            self.assertFalse(
+                any("substate_status_registers" in m for m in debug_messages)
+            )
+        self.assertEqual(self.validator.pc10_duration, 4.0)
+        self.assertEqual(self.validator.lpit_delta, {"cpu": 4000000, "system": 0})
+        self.assertEqual(self.validator.intel_deepest, "")
+        self.assertEqual(self.validator.intel_state, {})
+        failure = [f for f in self.validator.failures if isinstance(f, S0ixBlocked)]
+        self.assertEqual(len(failure), 1)
+        self.assertIn("XHCI_D3", str(failure[0]))
+        self.assertIn("latched on c10 entry", str(failure[0]))
+        self.validator.intel.set_param.assert_called_once_with(
+            "warn_on_s0ix_failures", "N"
+        )
+
+    COUNTER_REQUIREMENTS = """PMC0
+                                 Element |    S0i2.0 |    S0i2.1 |     Value |
+pmc0:                    XHCI_PGD0_PG_STS |           |  Required |       312 |
+pmc0:                   CLINK_PGD0_PG_STS |  Required |  Required |  64403613 |
+pmc0:                     CSE_PGD0_PG_STS |  Required |  Required |   1544512 |
+pmc0:                ITSS_CLK_SRC_REQ_STS |  Required |  Required |    207869 |
+"""
+
+    @patch("amd_debug.validator.save_cycle_state")
+    @patch("amd_debug.validator.read_lpit_residency", return_value={"cpu": 1, "system": 2})
+    def test_capture_intel_pre_snapshots_counters(self, _mock_lpit, _mock_save):
+        """The S0ix blocker counters are snapshotted before suspend"""
+        self.validator.intel.substate_residencies.return_value = {}
+        self.validator.intel.package_cstates.return_value = {}
+        self.validator.intel.latch_mode.return_value = True
+        self.validator.intel.get_param.return_value = "Y"
+        self.validator.intel.read.side_effect = lambda name: (
+            self.COUNTER_REQUIREMENTS if name == "substate_requirements" else None
+        )
+        self.validator.capture_intel_pre()
+        self.assertEqual(
+            self.validator.intel_state["requirements"],
+            {
+                "pmc0: XHCI_PGD0_PG_STS": 312,
+                "pmc0: CLINK_PGD0_PG_STS": 64403613,
+                "pmc0: CSE_PGD0_PG_STS": 1544512,
+                "pmc0: ITSS_CLK_SRC_REQ_STS": 207869,
+            },
+        )
+
+    @patch("amd_debug.validator.read_lpit_residency")
+    def test_capture_intel_post_blocked_counters(self, mock_lpit):
+        """Blocker counters: only IPs whose counter advanced are reported"""
+        self.validator.intel_state = self._state(
+            requirements={
+                "pmc0: XHCI_PGD0_PG_STS": 300,
+                "pmc0: CLINK_PGD0_PG_STS": 64400000,
+                "pmc0: CSE_PGD0_PG_STS": 1544512,
+                "pmc0: ITSS_CLK_SRC_REQ_STS": 207869,
+            }
+        )
+        self.validator.kernel_duration = 5
+        mock_lpit.return_value = {"cpu": 1000 + 4000000, "system": 2000}
+        self.validator.intel.substate_residencies.return_value = {"S0i2.0": 10}
+        self.validator.intel.package_cstates.return_value = {"Package C10": 150}
+        reads = {"substate_requirements": self.COUNTER_REQUIREMENTS}
+        self.validator.intel.read.side_effect = lambda name: reads.get(name)
+        with patch.object(self.validator.db, "record_cycle_data") as mock_cycle_data:
+            self.validator.capture_intel_post()
+            mock_cycle_data.assert_any_call(
+                "IPs blocking S0i2.0: pmc0: CLINK_PGD0_PG_STS (3613)", "❌"
+            )
+        failure = [f for f in self.validator.failures if isinstance(f, S0ixBlocked)]
+        self.assertEqual(len(failure), 1)
+        self.assertIn("blocker counter advanced", str(failure[0]))
+
+    @patch("amd_debug.validator.read_lpit_residency")
+    def test_capture_intel_post_blocked_counters_no_baseline(self, mock_lpit):
+        """Blocker counters without a baseline fall back to the latched status"""
+        self.validator.intel_state = self._state(requirements={})
+        self.validator.kernel_duration = 5
+        mock_lpit.return_value = {"cpu": 1000 + 4000000, "system": 2000}
+        self.validator.intel.substate_residencies.return_value = {"S0i2.0": 10}
+        self.validator.intel.package_cstates.return_value = {"Package C10": 150}
+        reads = {
+            "substate_requirements": self.COUNTER_REQUIREMENTS,
+            "substate_status_registers": (
+                "PMC0:LPM_STATUS_0:\t0x1\n"
+                "PMC0:CLINK_PGD0_PG_STS           0\n"
+                "PMC0:CSE_PGD0_PG_STS             1\n"
+                "PMC0:ITSS_CLK_SRC_REQ_STS        0\n"
+            ),
+        }
+        self.validator.intel.read.side_effect = lambda name: reads.get(name)
+        with patch.object(self.validator.db, "record_cycle_data") as mock_cycle_data:
+            self.validator.capture_intel_post()
+            mock_cycle_data.assert_any_call(
+                "IPs blocking S0i2.0: pmc0: CLINK_PGD0_PG_STS, pmc0: ITSS_CLK_SRC_REQ_STS",
+                "❌",
+            )
+
+    @patch("amd_debug.validator.read_lpit_residency")
+    def test_capture_intel_post_no_pc10(self, mock_lpit):
+        """No PC10 residency at all"""
+        self.validator.intel_state = self._state(warn_orig=None)
+        mock_lpit.return_value = {"cpu": 1000, "system": 2000}
+        self.validator.intel.substate_residencies.return_value = {}
+        self.validator.intel.package_cstates.return_value = {"Package C10": 100}
+        self.validator.intel.read.side_effect = lambda name: (
+            "regs" if name == "substate_status_registers" else None
+        )
+        with patch.object(
+            self.validator.db, "record_cycle_data"
+        ) as mock_cycle_data, patch.object(
+            self.validator.db, "record_debug"
+        ) as mock_debug:
+            self.validator.capture_intel_post()
+            mock_cycle_data.assert_any_call("Package C10 residency 0:00:00", "❌")
+            mock_cycle_data.assert_any_call("Package did not reach PC10", "❌")
+            debug_messages = [c.args[0] for c in mock_debug.call_args_list]
+            self.assertTrue(
+                any("substate_status_registers" in m for m in debug_messages)
+            )
+        self.assertTrue(any(isinstance(f, NoPackageC10) for f in self.validator.failures))
+        self.validator.intel.set_param.assert_not_called()
+
+    @patch("amd_debug.validator.read_lpit_residency")
+    def test_capture_intel_post_partial(self, mock_lpit):
+        """A shallow substate was reached but not the deeper one"""
+        self.validator.intel_state = self._state(latch="S0i2.0")
+        mock_lpit.return_value = {"cpu": 5001000, "system": 4002000}
+        self.validator.intel.substate_residencies.return_value = {
+            "S0i2.0": 4000010,
+            "S0i2.1": 20,
+        }
+        self.validator.intel.package_cstates.return_value = {}
+        self.validator.intel.read.side_effect = lambda name: (
+            self.REQUIREMENTS if name == "substate_requirements" else None
+        )
+        with patch.object(self.validator.db, "record_cycle_data") as mock_cycle_data:
+            self.validator.capture_intel_post()
+            mock_cycle_data.assert_any_call(
+                "S0ix substate residency: S0i2.0 0:00:04, S0i2.1 0:00:00", "💤"
+            )
+            mock_cycle_data.assert_any_call(
+                "Reached S0i2.0 but not S0i2.1, IPs not idle: XHCI_D3", "🚦"
+            )
+        self.assertEqual(self.validator.intel_deepest, "S0i2.0")
+        self.assertFalse(self.validator.failures)
+
+    @patch("amd_debug.validator.read_lpit_residency")
+    def test_capture_intel_post_deepest(self, mock_lpit):
+        """The deepest substate was reached, no warnings"""
+        self.validator.intel_state = self._state()
+        mock_lpit.return_value = {"cpu": 5001000, "system": 4002000}
+        self.validator.intel.substate_residencies.return_value = {
+            "S0i2.0": 10,
+            "S0i2.1": 4000020,
+        }
+        self.validator.intel.package_cstates.return_value = {}
+        self.validator.intel.read.side_effect = lambda name: (
+            self.REQUIREMENTS if name == "substate_requirements" else None
+        )
+        with patch.object(self.validator.db, "record_cycle_data") as mock_cycle_data:
+            self.validator.capture_intel_post()
+            symbols = [c.args[1] for c in mock_cycle_data.call_args_list]
+            self.assertNotIn("❌", symbols)
+            self.assertNotIn("🚦", symbols)
+        self.assertEqual(self.validator.intel_deepest, "S0i2.1")
+
+    @patch("amd_debug.validator.load_cycle_state")
+    @patch("amd_debug.validator.read_lpit_residency", return_value={"cpu": 2, "system": 2})
+    def test_capture_intel_post_loads_saved_state(self, _mock_lpit, mock_load):
+        """The systemd hook path loads the snapshot from disk"""
+        mock_load.return_value = {"lpit": {"cpu": 1, "system": 2}}
+        self.validator.intel.substate_residencies.return_value = {}
+        self.validator.intel.package_cstates.return_value = {}
+        self.validator.intel.read.return_value = None
+        self.validator.capture_intel_post()
+        mock_load.assert_called_once()
+        self.assertEqual(self.validator.lpit_delta, {"cpu": 1, "system": 0})
+
+    @patch("amd_debug.validator.load_cycle_state", return_value={})
+    def test_capture_intel_post_no_state(self, _mock_load):
+        """Without a snapshot nothing can be analyzed"""
+        with patch.object(self.validator.db, "record_debug") as mock_debug:
+            self.validator.capture_intel_post()
+            mock_debug.assert_called_once_with(
+                "No pre-suspend Intel counter snapshot available"
+            )
+        self.validator.intel.read.assert_not_called()
+
+    def test_analyze_kernel_log_slp_s0_failure(self):
+        """The intel_pmc_core SLP_S0 warning is surfaced"""
+        line = "intel_pmc_core INT33A1:00: CPU did not enter SLP_S0!!! (S0ix cnt=0)"
+        with patch.object(self.validator.db, "record_debug"):
+            self.validator._analyze_kernel_log_line(line, 4)
+        self.assertTrue(self.validator.slp_s0_failed)
+        self.validator.upep = True
+        with patch.object(
+            self.validator.kernel_log, "process_callback"
+        ), patch.object(self.validator.db, "record_cycle_data") as mock_cycle_data, patch.object(
+            self.validator.db, "record_debug"
+        ) as mock_debug:
+            self.validator.analyze_kernel_log()
+            mock_cycle_data.assert_called_once_with(
+                "Kernel reported CPU did not enter SLP_S0 (S0ix)", "❌"
+            )
+            mock_debug.assert_any_call("Used Intel uPEP GUID in LPS0 _DSM")
+
+    def test_post_resets_intel_state(self):
+        """post() resets the per cycle Intel bookkeeping"""
+        self.validator.slp_s0_failed = True
+        self.validator.lpit_delta = {"cpu": 1}
+        self.validator.pc10_duration = 3
+        methods = [
+            "capture_wakeup_irq_data",
+            "analyze_kernel_log",
+            "check_gpes",
+            "capture_lid",
+            "check_rtc_cmos",
+            "capture_intel_post",
+            "capture_hw_sleep",
+            "capture_battery",
+            "capture_power_rails",
+            "capture_amdgpu_ips_status",
+            "capture_thermal",
+            "capture_input_wakeup_count",
+        ]
+        patches = [patch.object(self.validator, m) for m in methods]
+        for p in patches:
+            p.start()
+        try:
+            with patch.object(self.validator.acpica, "restore"), patch.object(
+                self.validator.db, "record_cycle"
+            ):
+                self.validator.post()
+                self.validator.capture_intel_post.assert_called_once()
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertFalse(self.validator.slp_s0_failed)
+        self.assertEqual(self.validator.lpit_delta, {})
+        self.assertEqual(self.validator.pc10_duration, 0)

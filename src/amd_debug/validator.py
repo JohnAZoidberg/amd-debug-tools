@@ -17,18 +17,37 @@ from amd_debug.battery import Batteries
 from amd_debug.power_rails import PowerRails
 from amd_debug.kernel import get_kernel_log, get_kernel_command_line, sscanf_bios_args
 from amd_debug.common import (
+    apply_prefix_wrapper,
     print_color,
     read_file,
     check_lockdown,
+    get_cpu_vendor,
     run_countdown,
     BIT,
     AmdTool,
+    VENDOR_INTEL,
 )
 from amd_debug.acpi import AcpicaTracer
+from amd_debug.intel import (
+    IntelPmcCore,
+    blocker_method,
+    diff_counters,
+    find_substate_blockers,
+    load_cycle_state,
+    parse_substate_requirements,
+    parse_substate_status,
+    read_lpit_residency,
+    requirement_counters,
+    save_cycle_state,
+    substate_blocker_counts,
+    substate_order,
+)
 from amd_debug.failures import (
     AcpiBiosError,
     Irq1Workaround,
     LowHardwareSleepResidency,
+    NoPackageC10,
+    S0ixBlocked,
     SpuriousWakeup,
     RtcAlarmWrong,
     IommuPageFault,
@@ -91,6 +110,13 @@ class SleepValidator(AmdTool):
         self.power_rails = PowerRails()
         self.acpica = AcpicaTracer()
         self.bios_debug = bios_debug
+        self.cpu_vendor = get_cpu_vendor()
+        self.intel = IntelPmcCore()
+        self.intel_state = {}
+        self.intel_deepest = ""
+        self.lpit_delta = {}
+        self.pc10_duration = 0
+        self.slp_s0_failed = False
         self.cpu_family = ""
         self.cpu_model = ""
         self.cpu_model_string = ""
@@ -463,7 +489,13 @@ class SleepValidator(AmdTool):
         p = os.path.join("/", "sys", "power", "suspend_stats", "last_hw_sleep")
         if os.path.exists(p):
             self.hw_sleep_duration = int(read_file(p)) / 10**6
-        if not os.path.exists(p) and not self.hw_sleep_duration:
+        if self.cpu_vendor == VENDOR_INTEL and not self.hw_sleep_duration:
+            # intel_pmc_core only reports to suspend_stats when
+            # warn_on_s0ix_failures is set, so fall back to the LPIT counter
+            system = self.lpit_delta.get("system")
+            if system is not None:
+                self.hw_sleep_duration = system / 10**6
+        elif not os.path.exists(p) and not self.hw_sleep_duration:
             p = os.path.join("/", "sys", "kernel", "debug", "amd_pmc", "smu_fw_info")
             try:
                 val = read_file(p)
@@ -488,6 +520,162 @@ class SleepValidator(AmdTool):
         if not self.hw_sleep_duration:
             self.db.record_cycle_data("Did not reach hardware sleep state", "❌")
         return self.hw_sleep_duration > 0
+
+    def capture_intel_pre(self):
+        """Snapshot Intel residency counters and arm the pmc_core diagnostics"""
+        if self.cpu_vendor != VENDOR_INTEL:
+            return
+        state = {
+            "lpit": read_lpit_residency(),
+            "substates": {},
+            "pkgc": {},
+            "requirements": {},
+            "latch": "",
+            "warn_orig": None,
+        }
+        if not self.intel.available:
+            msg = "intel_pmc_core debugfs not available, S0ix substate analysis disabled"
+            if self.lockdown:
+                msg += " (kernel lockdown)"
+            self.db.record_debug(msg)
+        else:
+            state["substates"] = self.intel.substate_residencies()
+            state["pkgc"] = self.intel.package_cstates()
+            # Kernels with S0ix blocker counters report a cumulative per IP
+            # counter in substate_requirements; snapshot it so the post
+            # analysis can tell which IPs blocked during this cycle.
+            text = self.intel.read("substate_requirements")
+            if isinstance(text, str):
+                state["requirements"] = requirement_counters(
+                    parse_substate_requirements(text)
+                )
+            # Latch the requirement status on entry to the deepest substate
+            # reached in the previous cycle (or PC10 for the first cycle) so
+            # that the post analysis shows what blocked the next deeper one.
+            latch = self.intel_deepest or "c10"
+            if self.intel.latch_mode(latch):
+                state["latch"] = latch
+                self.db.record_debug(
+                    f"Latching S0ix substate requirements on {latch} entry"
+                )
+        # ask the kernel to report S0ix residency and log blockers on failure
+        orig = self.intel.get_param("warn_on_s0ix_failures")
+        if orig is not None and orig != "Y":
+            if self.intel.set_param("warn_on_s0ix_failures", "Y"):
+                state["warn_orig"] = orig
+        self.intel_state = state
+        save_cycle_state(state)
+
+    def capture_intel_post(self):
+        """Analyze Intel residency counters and S0ix substate requirements"""
+        if self.cpu_vendor != VENDOR_INTEL:
+            return
+        state = self.intel_state or load_cycle_state()
+        self.intel_state = {}
+        if not state:
+            self.db.record_debug("No pre-suspend Intel counter snapshot available")
+            return
+
+        # restore the module parameter first so it never stays modified
+        if state.get("warn_orig") is not None:
+            self.intel.set_param("warn_on_s0ix_failures", state["warn_orig"])
+
+        self.lpit_delta = diff_counters(state.get("lpit", {}), read_lpit_residency())
+        pc10 = self.lpit_delta.get("cpu")
+        if pc10 is not None:
+            self.pc10_duration = pc10 / 10**6
+            msg = f"Package C10 residency {timedelta(seconds=self.pc10_duration)}"
+            if self.kernel_duration:
+                percent = min(self.pc10_duration / self.kernel_duration, 1)
+                msg += f" ({percent:.2%} of kernel suspend)"
+            self.db.record_cycle_data(msg, "💤" if pc10 else "❌")
+
+        substates = diff_counters(
+            state.get("substates", {}), self.intel.substate_residencies()
+        )
+        reached = ""
+        if substates:
+            parts = []
+            for name in substate_order(substates):
+                parts.append(f"{name} {timedelta(seconds=substates[name] / 10**6)}")
+                if substates[name] > 0:
+                    reached = name
+            self.db.record_cycle_data(
+                "S0ix substate residency: " + ", ".join(parts),
+                "💤" if reached else "❌",
+            )
+        self.intel_deepest = reached
+
+        pkgc = diff_counters(state.get("pkgc", {}), self.intel.package_cstates())
+        if pkgc:
+            self.db.record_debug(
+                "Package C-state counter deltas: "
+                + ", ".join(f"{k} {v}" for k, v in pkgc.items())
+            )
+
+        entered_s0ix = bool(reached) or (self.lpit_delta.get("system") or 0) > 0
+        requirements_text = self.intel.read("substate_requirements")
+        requirements = {}
+        if requirements_text:
+            self.db.record_debug(
+                apply_prefix_wrapper("pmc_core substate_requirements:", requirements_text)
+            )
+            requirements = parse_substate_requirements(requirements_text)
+
+        blockers = []
+        if pc10 is not None and pc10 == 0:
+            self.db.record_cycle_data("Package did not reach PC10", "❌")
+            self.failures += [NoPackageC10(pkgc)]
+        elif requirements.get("modes"):
+            order = substate_order(requirements["modes"])
+            target = None
+            if not reached:
+                target = order[0]
+            elif reached in order and order.index(reached) + 1 < len(order):
+                target = order[order.index(reached) + 1]
+            if target:
+                before = state.get("requirements") or None
+                status = None
+                if requirements.get("format") == "counter" and not before:
+                    # no counter baseline (e.g. the pre hook didn't run), fall
+                    # back to the latched status bits
+                    text = self.intel.read("substate_status_registers")
+                    if isinstance(text, str):
+                        status = parse_substate_status(text) or None
+                blockers = find_substate_blockers(
+                    requirements, target, before=before, status=status
+                )
+                method = blocker_method(requirements, before=before, status=status)
+                latch = state.get("latch") or "c10"
+                counts = substate_blocker_counts(requirements, target, before)
+                if counts:
+                    # chronic blockers first: the counter advances for as long
+                    # as the IP blocked the attempt
+                    blockers = sorted(counts, key=counts.get, reverse=True)
+                    names = ", ".join(f"{b} ({counts[b]})" for b in blockers)
+                else:
+                    names = ", ".join(blockers) if blockers else "none reported"
+                if requirements.get("format") == "counter" and not method:
+                    names = "unknown (no blocker counter baseline)"
+                if not entered_s0ix:
+                    self.db.record_cycle_data(f"IPs blocking {target}: {names}", "❌")
+                    self.failures += [S0ixBlocked(target, blockers, latch, method)]
+                else:
+                    self.db.record_cycle_data(
+                        f"Reached {reached} but not {target}, IPs not idle: {names}",
+                        "🚦",
+                    )
+
+        for name in ["pch_ip_power_gating_status", "ltr_show"]:
+            text = self.intel.read(name)
+            if text:
+                self.db.record_debug(apply_prefix_wrapper(f"pmc_core {name}:", text))
+        if not entered_s0ix and not blockers:
+            text = self.intel.read("substate_status_registers")
+            if text:
+                self.db.record_debug(
+                    apply_prefix_wrapper("pmc_core substate_status_registers:", text)
+                )
 
     def capture_command_line(self):
         """Capture the kernel command line to debug"""
@@ -538,6 +726,8 @@ class SleepValidator(AmdTool):
             )
         elif Headers.Irq1Workaround in line:
             self.irq1_workaround = True
+        elif "CPU did not enter SLP_S0" in line:
+            self.slp_s0_failed = True
         # AMD-Vi: Event logged [IO_PAGE_FAULT device=0000:00:0c.0 domain=0x0000 address=0x7e800000 flags=0x0050]
         elif "Event logged [IO_PAGE_FAULT" in line:
             # get the device from string
@@ -595,7 +785,12 @@ class SleepValidator(AmdTool):
             if self.upep_microsoft:
                 self.db.record_debug("Used Microsoft uPEP GUID in LPS0 _DSM")
             else:
-                self.db.record_debug("Used AMD uPEP GUID in LPS0 _DSM")
+                vendor = "Intel" if self.cpu_vendor == VENDOR_INTEL else "AMD"
+                self.db.record_debug(f"Used {vendor} uPEP GUID in LPS0 _DSM")
+        if self.slp_s0_failed:
+            self.db.record_cycle_data(
+                "Kernel reported CPU did not enter SLP_S0 (S0ix)", "❌"
+            )
         if self.acpi_errors:
             self.db.record_cycle_data("ACPI BIOS errors found", "❌")
             self.failures += [AcpiBiosError(self.acpi_errors)]
@@ -660,6 +855,9 @@ class SleepValidator(AmdTool):
         self.notify_devices = []
         self.page_faults = []
         self.irq1_workaround = False
+        self.slp_s0_failed = False
+        self.lpit_delta = {}
+        self.pc10_duration = 0
 
         checks = [
             self.capture_wakeup_irq_data,
@@ -667,6 +865,7 @@ class SleepValidator(AmdTool):
             self.check_gpes,
             self.capture_lid,
             self.check_rtc_cmos,
+            self.capture_intel_post,
             self.capture_hw_sleep,
             self.capture_battery,
             self.capture_power_rails,
@@ -703,6 +902,7 @@ class SleepValidator(AmdTool):
         self.capture_amdgpu_ips_status()
         self.capture_thermal()
         self.capture_input_wakeup_count()
+        self.capture_intel_pre()
         if self.bios_debug:
             self.acpica.trace_bios()
         else:
