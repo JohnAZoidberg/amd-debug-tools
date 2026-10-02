@@ -127,7 +127,16 @@ def parse_hw_sleep(hw):
 class SleepReport(AmdTool):
     """Sleep report class"""
 
-    def __init__(self, since, until, fname, fmt, tool_debug, report_debug):
+    def __init__(
+        self,
+        since,
+        until,
+        fname,
+        fmt,
+        tool_debug,
+        report_debug,
+        ignore_rails=None,
+    ):
         log_prefix = "s2idle" if tool_debug else None
         super().__init__(log_prefix)
 
@@ -138,6 +147,10 @@ class SleepReport(AmdTool):
         self.debug = report_debug
         self.format = fmt
         self.failures = []
+        # Power rails excluded from the total, e.g. a rail that feeds other
+        # monitored rails and would otherwise be double counted
+        self.ignore_rails = set(ignore_rails or [])
+        self.seen_rails = set()
         if since and until:
             self.df = self.db.report_summary_dataframe(self.since, self.until)
             self.pre_process_dataframe()
@@ -201,8 +214,41 @@ class SleepReport(AmdTool):
                 else:
                     self.failures.append([index, problem, data])
 
+    def get_power_rail_powers(self, t0, duration):
+        """Calculate the average power of each rail for a given cycle
+
+        Args:
+            t0: Timestamp of cycle start
+            duration: Duration of cycle in seconds, used when the energy
+                      snapshots don't carry their own timestamps
+
+        Returns:
+            Tuple of (window in seconds, list of (label, watts, ignored))
+            where ignored rails are those excluded by the ignore list
+        """
+        power_rails = self.db.report_power_rails(t0)
+        duration = get_energy_window(power_rails, duration)
+        if not power_rails or not duration or np.isnan(duration):
+            return duration, []
+
+        rails = []
+        for rail_data in power_rails:
+            _t0, label, e0, e1, scale = rail_data[:5]
+            if e0 is None or e1 is None:
+                continue
+            self.seen_rails.add(label)
+
+            # pac194x/5x reports raw*scale in mW-seconds (millijoules)
+            energy_j = (e1 - e0) * scale / 1000.0
+            power_w = energy_j / duration
+            rails.append((label, power_w, label in self.ignore_rails))
+
+        return duration, rails
+
     def calculate_power_rail_totals(self, t0, duration):
-        """Calculate total power from all power rails for a given cycle
+        """Calculate total power from the power rails for a given cycle
+
+        Rails on the ignore list are left out of the sum.
 
         Args:
             t0: Timestamp of cycle start
@@ -212,25 +258,18 @@ class SleepReport(AmdTool):
         Returns:
             Total power in watts, or None if no valid data
         """
-        power_rails = self.db.report_power_rails(t0)
-        duration = get_energy_window(power_rails, duration)
-        if not power_rails or not duration or np.isnan(duration):
+        _window, rails = self.get_power_rail_powers(t0, duration)
+        counted = [power_w for _label, power_w, ignored in rails if not ignored]
+        if not counted:
             return None
+        return sum(counted)
 
-        total_power = 0.0
-        has_valid_data = False
-        for rail_data in power_rails:
-            _t0, label, e0, e1, scale = rail_data[:5]
-            if e0 is None or e1 is None:
-                continue
-
-            # pac194x/5x reports raw*scale in mW-seconds (millijoules)
-            energy_j = (e1 - e0) * scale / 1000.0
-            power_w = energy_j / duration
-            total_power += power_w
-            has_valid_data = True
-
-        return total_power if has_valid_data else None
+    def warn_unknown_ignored_rails(self):
+        """Warn about ignored rail names that no cycle recorded"""
+        for label in sorted(self.ignore_rails - self.seen_rails):
+            print_color(
+                f"Ignored power rail '{label}' was not recorded in any cycle", "🚦"
+            )
 
     def pre_process_dataframe(self):
         """Pre-process the pandas dataframe"""
@@ -256,6 +295,9 @@ class SleepReport(AmdTool):
             cycle_t0 = format_as_human(t0)
             total_power = self.calculate_power_rail_totals(cycle_t0, duration)
             power_rail_totals.append(total_power)
+
+        if self.ignore_rails and len(self.df.index):
+            self.warn_unknown_ignored_rails()
 
         # Use power rail data if available, otherwise fall back to battery
         has_power_rails = any(p is not None for p in power_rail_totals)
@@ -370,33 +412,23 @@ class SleepReport(AmdTool):
         Returns:
             Formatted string with power rail consumption data
         """
-        power_rails = self.db.report_power_rails(t0)
-        if not power_rails:
+        t1_seconds, rails = self.get_power_rail_powers(t0, t1_seconds)
+        if not rails:
             return ""
-        t1_seconds = get_energy_window(power_rails, t1_seconds)
 
-        # Build rail list first to check if we have any valid data
         rail_lines = []
         total_power = 0.0
-        for rail_data in power_rails:
-            _t0, label, e0, e1, scale = rail_data[:5]
-            if e0 is None or e1 is None or not t1_seconds or np.isnan(t1_seconds):
-                continue
-
-            # pac194x/5x reports raw*scale in mW-seconds (millijoules), so
-            energy_j = (e1 - e0) * scale / 1000.0
-            power_w = energy_j / t1_seconds
-            total_power += power_w
-
-            rail_lines.append(f"{label}: {power_w:.3f}W")
-
-        # Only show header if we have actual rail data
-        if not rail_lines:
-            return ""
+        for label, power_w, ignored in rails:
+            line = f"{label}: {power_w:.3f}W"
+            if ignored:
+                line += " (ignored)"
+            else:
+                total_power += power_w
+            rail_lines.append(line)
 
         output = f"\n━━━ Power Rail Consumption (over {t1_seconds:.1f}s) ━━━\n"
         output += "\n".join(rail_lines) + "\n"
-        output += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        output += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         output += f"Total: {total_power:.3f}W\n"
 
         return output

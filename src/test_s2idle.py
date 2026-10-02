@@ -4,6 +4,7 @@
 """
 This module contains unit tests for the s2idle tool in the amd-debug-tools package.
 """
+
 import argparse
 import sys
 import unittest
@@ -14,6 +15,7 @@ from unittest.mock import patch
 
 from amd_debug.s2idle import (
     parse_args,
+    parse_ignore_rails,
     main,
     install,
     uninstall,
@@ -87,6 +89,26 @@ class TestParseArgs(unittest.TestCase):
         self.assertEqual(args.until, "2023-02-01")
         self.assertEqual(args.format, "html")
         self.assertTrue(args.report_debug)
+        self.assertIsNone(args.ignore_rail)
+
+    def test_ignore_rail_arguments(self):
+        """--ignore-rail can be repeated and comma separated on both commands"""
+        sys.argv = [
+            "s2idle.py",
+            "report",
+            "--ignore-rail",
+            "SYS_IN",
+            "--ignore-rail",
+            "CPU_A, CPU_B,SYS_IN",
+        ]
+        args = parse_args()
+        self.assertEqual(
+            parse_ignore_rails(args.ignore_rail), ["SYS_IN", "CPU_A", "CPU_B"]
+        )
+        sys.argv = ["s2idle.py", "test", "--ignore-rail", "+18.2VB_POWER_1"]
+        args = parse_args()
+        self.assertEqual(parse_ignore_rails(args.ignore_rail), ["+18.2VB_POWER_1"])
+        self.assertEqual(parse_ignore_rails(None), [])
 
     @patch("sys.prefix", "amd_debug.s2idle")
     @patch("sys.base_prefix", "foo")
@@ -174,11 +196,12 @@ class TestMainFunction(unittest.TestCase):
                 format="html",
                 tool_debug=False,
                 report_debug=False,
+                ignore_rail=["SYS_IN"],
             )
             mock_report.return_value = True
             result = main()
             mock_report.assert_called_once_with(
-                "2023-01-01", "2023-02-01", None, "html", False, False
+                "2023-01-01", "2023-02-01", None, "html", False, False, ["SYS_IN"]
             )
             self.assertIsNone(result)
 
@@ -200,12 +223,13 @@ class TestMainFunction(unittest.TestCase):
                 random=False,
                 logind=False,
                 bios_debug=False,
+                ignore_rail=None,
             )
             mock_test.return_value = True
             result = main()
             mock_relaunch_sudo.assert_called_once()
             mock_test.assert_called_once_with(
-                None, None, "5", "txt", None, False, False, False, False, False
+                None, None, "5", "txt", None, False, False, False, False, False, []
             )
             self.assertIsNone(result)
 
@@ -419,7 +443,9 @@ class TestTestFunction(unittest.TestCase):
         mock_prerequisite_instance.report.assert_called_once()
         mock_prompt_test_arguments.assert_called_once_with(None, None, None, False)
         mock_prompt_report_arguments.assert_called_once()
-        mock_sleep_validator.assert_called_once_with(tool_debug=True, bios_debug=False)
+        mock_sleep_validator.assert_called_once_with(
+            tool_debug=True, bios_debug=False, ignore_rails=None
+        )
         mock_sleep_validator_instance.run.assert_called_once_with(
             duration=10, wait=5, count=3, rand=False, logind=False
         )
@@ -432,6 +458,7 @@ class TestTestFunction(unittest.TestCase):
             fmt="html",
             tool_debug=True,
             report_debug=True,
+            ignore_rails=None,
         )
         mock_sleep_report_instance.run.assert_called_once()
         mock_display_report_file.assert_called_once_with("report.html", "html")
@@ -530,6 +557,7 @@ class TestTestFunction(unittest.TestCase):
             fmt="html",
             tool_debug=True,
             report_debug=True,
+            ignore_rails=None,
         )
         mock_sleep_report_instance.run.assert_called_once()
         mock_display_report_file.assert_called_once_with("report.html", "html")
@@ -673,6 +701,7 @@ class TestReportFunction(unittest.TestCase):
             fmt="html",
             tool_debug=True,
             report_debug=True,
+            ignore_rails=None,
         )
         mock_sleep_report_instance.run.assert_called_once()
         mock_display_report_file.assert_called_once_with("report.html", "html")
@@ -731,6 +760,7 @@ class TestReportFunction(unittest.TestCase):
             fmt="html",
             tool_debug=True,
             report_debug=True,
+            ignore_rails=None,
         )
         self.assertFalse(result)
 
@@ -770,6 +800,7 @@ class TestReportFunction(unittest.TestCase):
             fmt="html",
             tool_debug=True,
             report_debug=True,
+            ignore_rails=None,
         )
         self.assertFalse(result)
 
@@ -809,6 +840,7 @@ class TestReportFunction(unittest.TestCase):
             fmt="html",
             tool_debug=True,
             report_debug=True,
+            ignore_rails=None,
         )
         mock_sleep_report_instance.run.assert_called_once()
         self.assertFalse(result)

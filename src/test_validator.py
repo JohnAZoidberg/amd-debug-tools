@@ -666,6 +666,7 @@ class TestValidator(unittest.TestCase):
             fmt="stdout",
             tool_debug=True,
             report_debug=False,
+            ignore_rails=None,
         )
 
         # Assert run method of SleepReport was called

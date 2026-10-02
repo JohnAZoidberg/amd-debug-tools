@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 """s2idle analysis tool"""
+
 import argparse
 import sys
 import os
@@ -49,6 +50,10 @@ class Headers:
     MaxDurationDescription = "What is the maximum suspend cycle length (seconds)"
     MaxWaitDescription = "What is the maximum time between suspend cycles (seconds)"
     ReportDebugDescription = "Enable debug output in report (increased size)"
+    IgnoreRailDescription = (
+        "Power rail label to leave out of the power total, for example a rail "
+        "that feeds other monitored rails (repeatable, or comma separated)"
+    )
 
 
 def display_report_file(fname, fmt) -> None:
@@ -171,7 +176,20 @@ def prompt_test_arguments(duration, wait, count, rand) -> list:
     return [duration, wait, count]
 
 
-def report(since, until, fname, fmt, tool_debug, report_debug) -> bool:
+def parse_ignore_rails(values) -> list[str]:
+    """Flatten repeated and comma separated --ignore-rail arguments"""
+    rails = []
+    for value in values or []:
+        for label in value.split(","):
+            label = label.strip()
+            if label and label not in rails:
+                rails.append(label)
+    return rails
+
+
+def report(
+    since, until, fname, fmt, tool_debug, report_debug, ignore_rails=None
+) -> bool:
     """Generate a report from previous sleep cycles"""
     try:
         since, until, fname, fmt, report_debug = prompt_report_arguments(
@@ -190,6 +208,7 @@ def report(since, until, fname, fmt, tool_debug, report_debug) -> bool:
             fmt=fmt,
             tool_debug=tool_debug,
             report_debug=report_debug,
+            ignore_rails=ignore_rails,
         )
     except sqlite3.OperationalError as e:
         print(f"Failed to generate report: {e}")
@@ -210,7 +229,17 @@ def report(since, until, fname, fmt, tool_debug, report_debug) -> bool:
 
 
 def run_test_cycle(
-    duration, wait, count, fmt, fname, force, debug, rand, logind, bios_debug
+    duration,
+    wait,
+    count,
+    fmt,
+    fname,
+    force,
+    debug,
+    rand,
+    logind,
+    bios_debug,
+    ignore_rails=None,
 ) -> bool:
     """Run a test"""
     app = Installer(tool_debug=debug)
@@ -241,7 +270,9 @@ def run_test_cycle(
     app.report()
 
     if run or force:
-        app = SleepValidator(tool_debug=debug, bios_debug=bios_debug)
+        app = SleepValidator(
+            tool_debug=debug, bios_debug=bios_debug, ignore_rails=ignore_rails
+        )
 
         run = app.run(
             duration=duration,
@@ -262,6 +293,7 @@ def run_test_cycle(
         fmt=fmt,
         tool_debug=debug,
         report_debug=report_debug,
+        ignore_rails=ignore_rails,
     )
     app.run()
 
@@ -349,6 +381,12 @@ def parse_args():
         help="Enable BIOS debug logging instead of notify logging",
     )
     test_cmd.add_argument("--report-file", help=Headers.ReportFileDescription)
+    test_cmd.add_argument(
+        "--ignore-rail",
+        action="append",
+        metavar="RAIL",
+        help=Headers.IgnoreRailDescription,
+    )
 
     # 'report' command
     report_cmd = subparsers.add_parser(
@@ -378,6 +416,12 @@ def parse_args():
         "--report-debug",
         action=argparse.BooleanOptionalAction,
         help="Include debug messages in report (WARNING: can significantly increase report size)",
+    )
+    report_cmd.add_argument(
+        "--ignore-rail",
+        action="append",
+        metavar="RAIL",
+        help=Headers.IgnoreRailDescription,
     )
 
     # if running in a venv, install/uninstall hook options
@@ -428,6 +472,7 @@ def main() -> None | int:
             args.format,
             args.tool_debug,
             args.report_debug,
+            parse_ignore_rails(args.ignore_rail),
         )
     elif args.action == "test":
         relaunch_sudo()
@@ -442,6 +487,7 @@ def main() -> None | int:
             args.random,
             args.logind,
             args.bios_debug,
+            parse_ignore_rails(args.ignore_rail),
         )
     elif args.version:
         print(version())

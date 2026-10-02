@@ -69,6 +69,7 @@ The following optional arguments are supported for this command:
         --logind              Use logind to suspend the system
         --tool-debug          Enable debug logging
         --bios-debug          Enable BIOS debug logging instead of notify logging
+        --ignore-rail RAIL    Power rail to leave out of the power total (see below)
 
 If the tool is launched with an environment that can call `xdg-open`, the report
 will be opened in a browser.
@@ -87,8 +88,26 @@ The following optional arguments are supported for this command:
         --report-debug
         --no-report-debug
                               Include debug messages in report (WARNING: can significantly increase report size)
+        --ignore-rail RAIL    Power rail to leave out of the power total (see below)
 If the tool is launched with an environment that can call `xdg-open`, the report
 will be opened in a browser.
+
+### Power rails
+On systems with a supported IIO power monitor (such as a PAC1954) the energy
+drawn on each monitored rail during the suspend is recorded, and the report
+lists the average power per rail with a total that is also used as the
+summary's "Average Power".  The rails are not always independent: a rail that
+feeds other monitored rails would be counted twice in the total.  Use
+`--ignore-rail` with the rail's label to leave it out of the total.  The
+argument can be repeated or given a comma separated list, and ignored rails
+are still listed, marked as "(ignored)".  For example, on a system where the
+battery input rail feeds the CPU and display rails:
+
+        amd-s2idle report --ignore-rail +18.2VB_POWER_1
+
+The option is accepted by both `test` and `report`; the energy counters of
+every rail are always recorded, so the choice can be changed when regenerating
+a report.
 
 ## `amd-s2idle --version`
 This will print the version of the tool and exit.

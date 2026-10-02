@@ -98,11 +98,12 @@ def pm_debugging(func):
 class SleepValidator(AmdTool):
     """Class to validate the sleep state"""
 
-    def __init__(self, tool_debug, bios_debug):
+    def __init__(self, tool_debug, bios_debug, ignore_rails=None):
         log_prefix = "s2idle" if tool_debug else None
         super().__init__(log_prefix)
 
         self.pyudev = Context()
+        self.ignore_rails = ignore_rails
 
         self.kernel_log = get_kernel_log()
         self.db = SleepDatabase()
@@ -1114,6 +1115,7 @@ class SleepValidator(AmdTool):
             fmt="stdout",
             tool_debug=self.display_debug,
             report_debug=False,
+            ignore_rails=self.ignore_rails,
         )
         app.run(inc_prereq=False)
         return

@@ -390,6 +390,54 @@ class TestSleepReport(unittest.TestCase):
         self.assertIsNone(self.report.calculate_power_rail_totals(t0, 33))
         self.assertEqual(self.report.format_power_rail_data(t0, 33), "")
 
+    def test_power_rails_ignore_list(self):
+        """Ignored rails are listed but left out of the total and Average Power."""
+        t0 = datetime(2023, 10, 10, 12, 0, 0)
+        self.mock_db.report_power_rails.return_value = [
+            (20231010120000, "SYS_IN", 0.0, 60000.0, 1.0, 1000.0, 1030.0),
+            (20231010120000, "CPU_CORE", 0.0, 15000.0, 1.0, 1000.0, 1030.0),
+            (20231010120000, "EDP", 0.0, 3000.0, 1.0, 1000.0, 1030.0),
+        ]
+        # Without an ignore list the feeder rail is double counted
+        self.assertAlmostEqual(self.report.calculate_power_rail_totals(t0, 33), 2.6)
+
+        self.report.ignore_rails = {"SYS_IN"}
+        self.assertAlmostEqual(self.report.calculate_power_rail_totals(t0, 33), 0.6)
+        summary = self.report.format_power_rail_data(t0, 33)
+        self.assertIn("SYS_IN: 2.000W (ignored)", summary)
+        self.assertIn("CPU_CORE: 0.500W\n", summary)
+        self.assertIn("Total: 0.600W", summary)
+
+        # Ignoring every rail leaves nothing to total
+        self.report.ignore_rails = {"SYS_IN", "CPU_CORE", "EDP"}
+        self.assertIsNone(self.report.calculate_power_rail_totals(t0, 33))
+
+    @patch("amd_debug.sleep_report.print_color")
+    def test_power_rails_ignore_list_summary(self, mock_print_color):
+        """The summary's Average Power excludes ignored rails and unknown names warn."""
+        self.mock_db.report_power_rails.return_value = [
+            (20231010120000, "SYS_IN", 0.0, 60000.0, 1.0, 1000.0, 1030.0),
+            (20231010120000, "CPU_CORE", 0.0, 15000.0, 1.0, 1000.0, 1030.0),
+        ]
+        self.report.ignore_rails = {"SYS_IN", "NOPE"}
+        self.report.df = pd.DataFrame(
+            {
+                "t0": [datetime(2023, 10, 10, 12, 0, 0).strftime("%Y%m%d%H%M%S")],
+                "t1": [datetime(2023, 10, 10, 12, 0, 33).strftime("%Y%m%d%H%M%S")],
+                "hw": [30],
+                "requested": [30],
+                "gpio": [""],
+                "wake_irq": ["9"],
+                "b0": [90000000],
+                "b1": [85000000],
+                "full": [100000000],
+            }
+        )
+        self.report.pre_process_dataframe()
+        self.assertAlmostEqual(self.report.df["Average Power"].iloc[0], 0.5, places=3)
+        mock_print_color.assert_called_once()
+        self.assertIn("'NOPE'", mock_print_color.call_args[0][0])
+
     def test_get_prereq_data_preserves_markup_for_html_tables(self):
         """Ensure HTML prerequisite tables remain Markup and are not escaped."""
         self.report.format = "html"
