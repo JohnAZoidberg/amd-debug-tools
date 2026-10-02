@@ -158,11 +158,25 @@ class SleepReport(AmdTool):
         self.battery_svg = None
         self.hwsleep_svg = None
 
-    def analyze_duration(self, index, t0, t1, requested, hw):
-        """Analyze the duration of the cycle"""
+    def analyze_duration(self, index, t0, t1, requested, hw, window=None):
+        """Analyze the duration of the cycle
+
+        Args:
+            t0, t1: Start and end of the whole cycle
+            requested: Requested sleep length in seconds
+            hw: Hardware sleep residency in percent of the sleep window
+            window: Sleep window in seconds (the time between the energy
+                    snapshots taken around the suspend); defaults to the
+                    whole cycle
+        """
         duration = t1 - t0
+        if window is None or math.isnan(window):
+            window = duration.total_seconds()
+        # Gate on the whole cycle: the window of a 60 s cycle is just under 60 s
         if duration.total_seconds() >= 60 and hw < 90:
-            failure = LowHardwareSleepResidency(duration, hw / 100)
+            failure = LowHardwareSleepResidency(
+                timedelta(seconds=round(window)), hw / 100
+            )
             problem = failure.get_description()
             data = str(failure)
             if self.format == "html":
@@ -193,9 +207,17 @@ class SleepReport(AmdTool):
             "t0"
         ].apply(format_as_seconds)
         self.df["Duration"] = self.df["Duration"].replace(0, np.nan)
-        self.df["Hardware Sleep"] = (self.df["hw"] / self.df["Duration"]).apply(
-            parse_hw_sleep
-        )
+
+        # The sleep window is the time between the energy snapshots taken
+        # immediately around the suspend.  The whole cycle also contains the
+        # data collection before and after the suspend, which would be
+        # counted against hardware sleep residency; older cycles only have
+        # the full cycle duration.
+        window = self.df["Duration"]
+        if "ts0" in self.df.columns and "ts1" in self.df.columns:
+            snapshot_window = self.df["ts1"] - self.df["ts0"]
+            window = snapshot_window.where(snapshot_window > 0, window)
+        self.df["Hardware Sleep"] = (self.df["hw"] / window).apply(parse_hw_sleep)
 
         # Average power comes from the battery. Power rails are reported
         # individually in the debug data: they are not guaranteed to be
@@ -206,12 +228,6 @@ class SleepReport(AmdTool):
             self.df["Battery Delta"] = (
                 (self.df["b1"] - self.df["b0"]) / self.df["full"] * 100
             )
-            # Prefer the time between the energy snapshots taken around the
-            # suspend; older cycles only have the full cycle duration
-            window = self.df["Duration"]
-            if "ts0" in self.df.columns and "ts1" in self.df.columns:
-                snapshot_window = self.df["ts1"] - self.df["ts0"]
-                window = snapshot_window.where(snapshot_window > 0, window)
             self.df["Average Power"] = (
                 (self.df["b1"] - self.df["b0"]) / 1000000 / (window / 3600)
             )
@@ -224,13 +240,14 @@ class SleepReport(AmdTool):
 
         # Look for spurious wakeups and low hardware residency
         [
-            self.analyze_duration(index, t0, t1, requested, hw)
-            for index, t0, t1, requested, hw in zip(
+            self.analyze_duration(index, t0, t1, requested, hw, w)
+            for index, t0, t1, requested, hw, w in zip(
                 self.df.index,
                 self.df["t0"].apply(format_as_human),
                 self.df["t1"].apply(format_as_human),
                 self.df["requested"],
                 self.df["Hardware Sleep"],
+                window,
             )
         ]
         del self.df["requested"]

@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from unittest.mock import patch
+import numpy as np
 import pandas as pd
 from markupsafe import Markup
 
@@ -164,7 +165,7 @@ class TestSleepReport(unittest.TestCase):
         self.assertEqual(len(self.report.failures), 2)
 
     def test_analyze_duration_residency_text(self):
-        """The residency failure reports the duration and percent sensibly."""
+        """The residency failure reports the window and percent sensibly."""
         self.report.failures = []
         self.report.analyze_duration(
             index=0,
@@ -172,12 +173,26 @@ class TestSleepReport(unittest.TestCase):
             t1=datetime(2023, 10, 10, 12, 1, 5),
             requested=60,
             hw=86.15,
+            window=59.6,
         )
         self.assertEqual(len(self.report.failures), 1)
         text = self.report.failures[0][2]
-        self.assertIn("asleep for 0:01:05", text)
+        self.assertIn("asleep for 0:01:00", text)
         self.assertIn("86.15%", text)
         self.assertNotIn("8615", text)
+
+    def test_analyze_duration_short_cycle(self):
+        """Residency is only judged for cycles of at least 60 seconds."""
+        self.report.failures = []
+        self.report.analyze_duration(
+            index=0,
+            t0=datetime(2023, 10, 10, 12, 0, 0),
+            t1=datetime(2023, 10, 10, 12, 0, 50),
+            requested=20,
+            hw=10,
+            window=45,
+        )
+        self.assertEqual(len(self.report.failures), 0)
 
     @patch("amd_debug.sleep_report.Environment")
     @patch("amd_debug.sleep_report.FileSystemLoader")
@@ -296,6 +311,58 @@ class TestSleepReport(unittest.TestCase):
         self.assertAlmostEqual(self.report.df["Average Power"].iloc[0], -10, places=3)
         self.assertNotIn("ts0", self.report.df.columns)
         self.assertNotIn("ts1", self.report.df.columns)
+
+    def test_hw_sleep_uses_snapshot_window(self):
+        """Hardware sleep residency divides by the snapshot window when present."""
+        self.report.failures = []
+        self.report.df = pd.DataFrame(
+            {
+                "t0": [datetime(2023, 10, 10, 12, 0, 0).strftime("%Y%m%d%H%M%S")],
+                "t1": [datetime(2023, 10, 10, 12, 1, 5).strftime("%Y%m%d%H%M%S")],
+                "hw": [56],
+                "requested": [60],
+                "gpio": [""],
+                "wake_irq": ["9"],
+                "b0": [90000000],
+                "b1": [85000000],
+                "full": [100000000],
+                "ts0": [1000.0],
+                "ts1": [1000.0 + 59.6],
+            }
+        )
+        self.report.pre_process_dataframe()
+        # 56 s of hardware sleep in a 59.6 s window, not the 65 s cycle
+        self.assertAlmostEqual(
+            self.report.df["Hardware Sleep"].iloc[0], 56 / 59.6 * 100, places=3
+        )
+        self.assertEqual(self.report.failures, [])
+        # The cycle duration shown in the summary is still the whole cycle
+        self.assertEqual(self.report.df["Duration"].iloc[0], 65)
+
+    def test_hw_sleep_falls_back_to_cycle_duration(self):
+        """Cycles without snapshot timestamps use the whole cycle duration."""
+        self.report.failures = []
+        self.report.df = pd.DataFrame(
+            {
+                "t0": [datetime(2023, 10, 10, 12, 0, 0).strftime("%Y%m%d%H%M%S")],
+                "t1": [datetime(2023, 10, 10, 12, 1, 5).strftime("%Y%m%d%H%M%S")],
+                "hw": [56],
+                "requested": [60],
+                "gpio": [""],
+                "wake_irq": ["9"],
+                "b0": [90000000],
+                "b1": [85000000],
+                "full": [100000000],
+                "ts0": [np.nan],
+                "ts1": [np.nan],
+            }
+        )
+        self.report.pre_process_dataframe()
+        self.assertAlmostEqual(
+            self.report.df["Hardware Sleep"].iloc[0], 56 / 65 * 100, places=3
+        )
+        self.assertEqual(len(self.report.failures), 1)
+        self.assertIn("asleep for 0:01:05", self.report.failures[0][2])
 
     def test_format_power_rail_data_uses_snapshot_window(self):
         """Rail power divides the energy delta by the snapshot window when present."""
