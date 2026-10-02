@@ -101,6 +101,22 @@ def format_timedelta(val):
     return str(timedelta(seconds=val))
 
 
+def get_energy_window(power_rails, duration):
+    """Seconds between the energy snapshots taken around a suspend
+
+    Args:
+        power_rails: Rows from the power_rails table (t0, label, e0, e1, scale, ts0, ts1)
+        duration: Fallback for cycles recorded before snapshot timestamps were stored
+    """
+    for rail_data in power_rails:
+        if len(rail_data) < 7:
+            continue
+        ts0, ts1 = rail_data[5], rail_data[6]
+        if ts0 is not None and ts1 is not None and ts1 > ts0:
+            return ts1 - ts0
+    return duration
+
+
 def parse_hw_sleep(hw):
     """Parse the hardware sleep value, throwing out garbage values"""
     if hw > 1:
@@ -176,19 +192,21 @@ class SleepReport(AmdTool):
 
         Args:
             t0: Timestamp of cycle start
-            duration: Duration of cycle in seconds
+            duration: Duration of cycle in seconds, used when the energy
+                      snapshots don't carry their own timestamps
 
         Returns:
             Total power in watts, or None if no valid data
         """
         power_rails = self.db.report_power_rails(t0)
-        if not power_rails or duration == 0:
+        duration = get_energy_window(power_rails, duration)
+        if not power_rails or not duration or np.isnan(duration):
             return None
 
         total_power = 0.0
         has_valid_data = False
         for rail_data in power_rails:
-            _t0, label, e0, e1, scale = rail_data
+            _t0, label, e0, e1, scale = rail_data[:5]
             if e0 is None or e1 is None:
                 continue
 
@@ -226,8 +244,14 @@ class SleepReport(AmdTool):
             self.df["Battery Delta"] = (
                 (self.df["b1"] - self.df["b0"]) / self.df["full"] * 100
             )
+            # Prefer the time between the energy snapshots taken around the
+            # suspend; older cycles only have the full cycle duration
+            window = self.df["Duration"]
+            if "ts0" in self.df.columns and "ts1" in self.df.columns:
+                snapshot_window = self.df["ts1"] - self.df["ts0"]
+                window = snapshot_window.where(snapshot_window > 0, window)
             self.df["Average Power"] = (
-                (self.df["b1"] - self.df["b0"]) / 1000000 / (self.df["Duration"] / 3600)
+                (self.df["b1"] - self.df["b0"]) / 1000000 / (window / 3600)
             )
 
         # Wake sources
@@ -257,6 +281,9 @@ class SleepReport(AmdTool):
         del self.df["full"]
         del self.df["t1"]
         del self.df["hw"]
+        for col in ("ts0", "ts1"):
+            if col in self.df.columns:
+                del self.df[col]
 
     def post_process_dataframe(self):
         """Display pandas dataframe in a more user friendly format"""
@@ -320,7 +347,8 @@ class SleepReport(AmdTool):
 
         Args:
             t0: Timestamp of cycle start
-            t1_seconds: Duration of cycle in seconds
+            t1_seconds: Duration of cycle in seconds, used when the energy
+                        snapshots don't carry their own timestamps
 
         Returns:
             Formatted string with power rail consumption data
@@ -328,13 +356,14 @@ class SleepReport(AmdTool):
         power_rails = self.db.report_power_rails(t0)
         if not power_rails:
             return ""
+        t1_seconds = get_energy_window(power_rails, t1_seconds)
 
         # Build rail list first to check if we have any valid data
         rail_lines = []
         total_power = 0.0
         for rail_data in power_rails:
-            _t0, label, e0, e1, scale = rail_data
-            if e0 is None or e1 is None or t1_seconds == 0:
+            _t0, label, e0, e1, scale = rail_data[:5]
+            if e0 is None or e1 is None or not t1_seconds or np.isnan(t1_seconds):
                 continue
 
             # pac194x/5x reports raw*scale in mW-seconds (millijoules), so
@@ -348,7 +377,7 @@ class SleepReport(AmdTool):
         if not rail_lines:
             return ""
 
-        output = "\n━━━ Power Rail Consumption ━━━\n"
+        output = f"\n━━━ Power Rail Consumption (over {t1_seconds:.1f}s) ━━━\n"
         output += "\n".join(rail_lines) + "\n"
         output += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         output += f"Total: {total_power:.3f}W\n"

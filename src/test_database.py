@@ -4,6 +4,9 @@
 """
 This module contains unit tests for the datbase functions in the amd-debug-tools package.
 """
+import os
+import sqlite3
+import tempfile
 import unittest
 
 from datetime import datetime
@@ -98,7 +101,7 @@ class TestSleepDatabase(unittest.TestCase):
         """Test reporting battery data"""
         timestamp = datetime.now()
         self.db.start_cycle(timestamp)
-        self.db.record_battery_energy("Battery1", 50, 100, "mWh")
+        self.db.record_battery_energy("Battery1", 50, 100, "mWh", timestamp=1000.0)
         result = self.db.report_battery(timestamp)
         self.assertEqual(
             result,
@@ -110,9 +113,29 @@ class TestSleepDatabase(unittest.TestCase):
                     None,
                     100,
                     "mWh",
+                    1000.0,
+                    None,
                 )
             ],
         )
+
+    def test_record_battery_energy_timestamps(self):
+        """Test that both battery snapshots record when they were taken"""
+        timestamp = datetime.now()
+        self.db.start_cycle(timestamp)
+        self.db.record_battery_energy("Battery1", 50, 100, "mWh", timestamp=1000.0)
+        self.db.record_battery_energy("Battery1", 40, 100, "mWh", timestamp=1030.5)
+        result = self.db.report_battery(timestamp)
+        self.assertEqual(result[0][2:], (50, 40, 100, "mWh", 1000.0, 1030.5))
+
+    @patch("amd_debug.database.time.time", return_value=12345.5)
+    def test_record_battery_energy_default_timestamp(self, _mock_time):
+        """Test that the battery snapshot timestamp defaults to now"""
+        timestamp = datetime.now()
+        self.db.start_cycle(timestamp)
+        self.db.record_battery_energy("Battery1", 50, 100, "mWh")
+        result = self.db.report_battery(timestamp)
+        self.assertEqual(result[0][6], 12345.5)
 
     def test_record_prereq(self):
         """Test recording a prereq message"""
@@ -342,8 +365,12 @@ class TestSleepDatabase(unittest.TestCase):
         """Test reporting power rails"""
         timestamp = datetime.now()
         self.db.start_cycle(timestamp)
-        self.db.record_power_rail_energy("CPU_VDDCR_PH1", 1000000.0, 149011.611)
-        self.db.record_power_rail_energy("CPU_VDDCR_PH1", 1050000.0, 149011.611)
+        self.db.record_power_rail_energy(
+            "CPU_VDDCR_PH1", 1000000.0, 149011.611, timestamp=1000.0
+        )
+        self.db.record_power_rail_energy(
+            "CPU_VDDCR_PH1", 1050000.0, 149011.611, timestamp=1030.5
+        )
         result = self.db.report_power_rails(timestamp)
         self.assertEqual(
             result,
@@ -354,9 +381,20 @@ class TestSleepDatabase(unittest.TestCase):
                     1000000.0,
                     1050000.0,
                     149011.611,
+                    1000.0,
+                    1030.5,
                 )
             ],
         )
+
+    @patch("amd_debug.database.time.time", return_value=12345.5)
+    def test_record_power_rail_energy_default_timestamp(self, _mock_time):
+        """Test that the power rail snapshot timestamp defaults to now"""
+        timestamp = datetime.now()
+        self.db.start_cycle(timestamp)
+        self.db.record_power_rail_energy("CPU_VDDCR_PH1", 1000000.0, 149011.611)
+        result = self.db.report_power_rails(timestamp)
+        self.assertEqual(result[0][5:], (12345.5, None))
 
     def test_report_power_rails_no_data(self):
         """Test reporting power rails when no data exists"""
@@ -396,7 +434,70 @@ class TestSleepDatabase(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result[0], "power_rails")
 
-        # Verify schema version is 2
+        # Verify schema version is current
         cur.execute("PRAGMA user_version")
         version = cur.fetchone()[0]
-        self.assertEqual(version, 2)
+        self.assertEqual(version, 3)
+
+    def _columns(self, db, table):
+        cur = db.db.cursor()
+        cur.execute(f"PRAGMA table_info({table})")
+        return [row[1] for row in cur.fetchall()]
+
+    def test_schema_migration_v2_to_v3(self):
+        """Test that a v2 database gains the energy snapshot timestamp columns"""
+        with tempfile.TemporaryDirectory() as tmp:
+            dbf = os.path.join(tmp, "data.db")
+            con = sqlite3.connect(dbf)
+            cur = con.cursor()
+            cur.execute(
+                "CREATE TABLE battery (t0 INTEGER PRIMARY KEY, name TEXT, b0 INTEGER, "
+                "b1 INTEGER, full INTEGER, unit TEXT)"
+            )
+            cur.execute(
+                "CREATE TABLE power_rails (t0 INTEGER, label TEXT, e0 REAL, e1 REAL, "
+                "scale REAL, PRIMARY KEY(t0, label))"
+            )
+            cur.execute("INSERT INTO battery VALUES (1, 'BAT0', 10, 5, 100, 'W')")
+            cur.execute("PRAGMA user_version = 2")
+            con.commit()
+            con.close()
+
+            db = SleepDatabase(dbf=dbf)
+            for table in ("battery", "power_rails"):
+                self.assertIn("ts0", self._columns(db, table))
+                self.assertIn("ts1", self._columns(db, table))
+            cur = db.db.cursor()
+            cur.execute("PRAGMA user_version")
+            self.assertEqual(cur.fetchone()[0], 3)
+            # Old rows survive with no timestamps
+            cur.execute("SELECT b0, b1, ts0, ts1 FROM battery")
+            self.assertEqual(cur.fetchone(), (10, 5, None, None))
+            del db
+
+    def test_schema_migration_v0_chains(self):
+        """Test that a v0 database receives every migration step"""
+        with tempfile.TemporaryDirectory() as tmp:
+            dbf = os.path.join(tmp, "data.db")
+            con = sqlite3.connect(dbf)
+            cur = con.cursor()
+            cur.execute(
+                "CREATE TABLE debug (t0 INTEGER, id INTEGER, message TEXT, "
+                "PRIMARY KEY(t0, id))"
+            )
+            cur.execute(
+                "CREATE TABLE battery (t0 INTEGER PRIMARY KEY, name TEXT, b0 INTEGER, "
+                "b1 INTEGER, full INTEGER, unit TEXT)"
+            )
+            cur.execute("PRAGMA user_version = 0")
+            con.commit()
+            con.close()
+
+            db = SleepDatabase(dbf=dbf)
+            self.assertIn("priority", self._columns(db, "debug"))
+            self.assertIn("ts1", self._columns(db, "battery"))
+            self.assertIn("ts1", self._columns(db, "power_rails"))
+            cur = db.db.cursor()
+            cur.execute("PRAGMA user_version")
+            self.assertEqual(cur.fetchone()[0], 3)
+            del db

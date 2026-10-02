@@ -126,6 +126,17 @@ class TestValidator(unittest.TestCase):
             mock_record_debug.assert_called_with("BAT0 energy level is 50000 µWh")
             mock_record_battery_energy.assert_called_with("BAT0", 50000, 60000, "W")
 
+    def test_capture_energy(self):
+        """Test capture_energy snapshots both the battery and the power rails"""
+        with patch.object(
+            self.validator, "capture_battery"
+        ) as mock_capture_battery, patch.object(
+            self.validator, "capture_power_rails"
+        ) as mock_capture_power_rails:
+            self.validator.capture_energy()
+            mock_capture_battery.assert_called_once()
+            mock_capture_power_rails.assert_called_once()
+
     def test_check_rtc_cmos(self):
         """Test check_rtc_cmos method"""
         with patch(
@@ -469,7 +480,8 @@ class TestValidator(unittest.TestCase):
             self.validator.prep()
             mock_seek_tail.assert_called_once()
             mock_start_cycle.assert_called_once_with("mocked_datetime")
-            mock_capture_battery.assert_called_once()
+            # energy snapshots are taken by capture_energy right before suspend
+            mock_capture_battery.assert_not_called()
             mock_check_gpes.assert_called_once()
             mock_capture_lid.assert_called_once()
             mock_capture_command_line.assert_called_once()
@@ -505,7 +517,7 @@ class TestValidator(unittest.TestCase):
             self.validator.prep()
             mock_seek_tail.assert_called_once()
             mock_start_cycle.assert_called_once_with("mocked_datetime")
-            mock_capture_battery.assert_called_once()
+            mock_capture_battery.assert_not_called()
             mock_check_gpes.assert_called_once()
             mock_capture_lid.assert_called_once()
             mock_capture_command_line.assert_called_once()
@@ -577,7 +589,8 @@ class TestValidator(unittest.TestCase):
             mock_capture_lid.assert_called_once()
             mock_check_rtc_cmos.assert_called_once()
             mock_capture_hw_sleep.assert_called_once()
-            mock_capture_battery.assert_called_once()
+            # energy snapshots are taken by capture_energy right after resume
+            mock_capture_battery.assert_not_called()
             mock_capture_amdgpu_ips_status.assert_called_once()
             mock_capture_thermal.assert_called_once()
             mock_capture_input_wakeup_count.assert_called_once()
@@ -668,8 +681,10 @@ class TestValidator(unittest.TestCase):
     @patch.object(SleepValidator, "unlock_session")
     @patch.object(SleepValidator, "report_cycle")
     @patch("amd_debug.validator.print_color")
+    @patch.object(SleepValidator, "capture_energy")
     def test_run(
         self,
+        mock_capture_energy,
         _mock_print_color,
         mock_report_cycle,
         mock_unlock_session,
@@ -711,6 +726,8 @@ class TestValidator(unittest.TestCase):
         mock_post.assert_called()
         mock_report_cycle.assert_called()
         mock_unlock_session.assert_called()
+        # Energy is snapshotted immediately before and after each suspend
+        self.assertEqual(mock_capture_energy.call_count, 4)
 
         # Test case 4: Randomized test, but too short of a duration
         result = self.validator.run(
@@ -727,6 +744,7 @@ class TestValidator(unittest.TestCase):
         self.assertEqual(mock_post.call_count, 4)
         self.assertEqual(mock_report_cycle.call_count, 5)
         self.assertEqual(mock_unlock_session.call_count, 3)
+        self.assertEqual(mock_capture_energy.call_count, 8)
 
         # Test case 6: suspend_system fails
         mock_suspend_system.return_value = False
@@ -735,6 +753,8 @@ class TestValidator(unittest.TestCase):
         )
         self.assertFalse(result)
         mock_report_cycle.assert_called()
+        # Only the pre-suspend snapshot is taken when the suspend fails
+        self.assertEqual(mock_capture_energy.call_count, 9)
 
     @patch("os.path.exists")
     @patch("builtins.open", new_callable=mock_open, read_data="3")
@@ -1176,18 +1196,23 @@ class TestValidator(unittest.TestCase):
     def test_systemd_pre_hook(self):
         """systemd_pre_hook calls prep, sync, and enables pm_debug"""
         with patch.object(self.validator, "prep") as mock_prep, patch.object(
+            self.validator, "capture_energy"
+        ) as mock_capture_energy, patch.object(
             self.validator.db, "sync"
         ) as mock_sync, patch(
             "amd_debug.validator.toggle_pm_debug"
         ) as mock_toggle:
             self.validator.systemd_pre_hook()
             mock_prep.assert_called_once()
+            mock_capture_energy.assert_called_once()
             mock_sync.assert_called_once()
             mock_toggle.assert_called_once_with(True)
 
     def test_systemd_post_hook(self):
         """systemd_post_hook restores state and runs post-processing"""
         with patch.object(self.validator, "post") as mock_post, patch.object(
+            self.validator, "capture_energy"
+        ) as mock_capture_energy, patch.object(
             self.validator.db, "sync"
         ) as mock_sync, patch.object(
             self.validator.db, "get_last_cycle", return_value=("20250101000000",)
@@ -1202,6 +1227,7 @@ class TestValidator(unittest.TestCase):
             mock_toggle.assert_called_once_with(False)
             mock_seek_tail.assert_called_once()
             mock_start_cycle.assert_called_once()
+            mock_capture_energy.assert_called_once()
             mock_post.assert_called_once()
             mock_sync.assert_called_once()
 

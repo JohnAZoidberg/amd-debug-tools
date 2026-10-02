@@ -3,10 +3,23 @@
 from datetime import datetime
 import sqlite3
 import os
+import time
 
 from amd_debug.common import read_file
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+
+def add_column(cur, table, column, ctype) -> None:
+    """Add a column to a table unless it already exists
+
+    Tables are created with the current schema before migration runs, so a
+    table that was missing in an old database already has the column.
+    """
+    cur.execute(f"PRAGMA table_info({table})")
+    if column in [row[1] for row in cur.fetchall()]:
+        return
+    cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ctype}")
 
 
 def migrate(cur, user_version) -> None:
@@ -15,11 +28,11 @@ def migrate(cur, user_version) -> None:
     val = cur.fetchone()[0]
     # Schema 1
     # - add priority column
-    if val == 0:
-        cur.execute("ALTER TABLE debug ADD COLUMN priority INTEGER")
+    if val < 1:
+        add_column(cur, "debug", "priority", "INTEGER")
     # Schema 2
     # - add power_rails table
-    if val == 1:
+    if val < 2:
         cur.execute(
             "CREATE TABLE IF NOT EXISTS power_rails ("
             "t0 INTEGER, "
@@ -29,6 +42,12 @@ def migrate(cur, user_version) -> None:
             "scale REAL, "
             "PRIMARY KEY(t0, label))"
         )
+    # Schema 3
+    # - add timestamps for when energy snapshots were taken
+    if val < 3:
+        for table in ("battery", "power_rails"):
+            for column in ("ts0", "ts1"):
+                add_column(cur, table, column, "REAL")
     # Update schema if necessary
     if val != user_version:
         cur.execute(f"PRAGMA user_version = {user_version}")
@@ -91,7 +110,9 @@ class SleepDatabase:
             "b0 INTEGER,"
             "b1 INTEGER,"
             "full INTEGER,"
-            "unit TEXT)"
+            "unit TEXT,"
+            "ts0 REAL,"
+            "ts1 REAL)"
         )
         cur.execute(
             "CREATE TABLE IF NOT EXISTS power_rails ("
@@ -100,6 +121,8 @@ class SleepDatabase:
             "e0 REAL,"
             "e1 REAL,"
             "scale REAL,"
+            "ts0 REAL,"
+            "ts1 REAL,"
             "PRIMARY KEY(t0, label))"
         )
         self.prereq_data_cnt = 0
@@ -167,10 +190,20 @@ class SleepDatabase:
         except PermissionError:
             self.record_debug(f"Unable to capture {fn}")
 
-    def record_battery_energy(self, name, energy, full, unit):
-        """Helper function to record battery energy"""
+    def record_battery_energy(self, name, energy, full, unit, timestamp=None):
+        """Helper function to record battery energy
+
+        First call (before suspend): INSERT with b0/ts0
+        Second call (after resume): UPDATE with b1/ts1
+
+        Args:
+            timestamp: Wall clock time (seconds since the epoch) the energy
+                       was sampled; defaults to now
+        """
         assert self.db
         assert self.last_suspend
+        if timestamp is None:
+            timestamp = time.time()
         cur = self.db.cursor()
         cur.execute(
             "SELECT * FROM battery WHERE t0=?",
@@ -178,14 +211,18 @@ class SleepDatabase:
         )
         if cur.fetchone():
             cur.execute(
-                "UPDATE battery SET b1=? WHERE t0=?",
-                (energy, int(self.last_suspend.strftime("%Y%m%d%H%M%S"))),
+                "UPDATE battery SET b1=?, ts1=? WHERE t0=?",
+                (
+                    energy,
+                    timestamp,
+                    int(self.last_suspend.strftime("%Y%m%d%H%M%S")),
+                ),
             )
         else:
             cur.execute(
                 """
-                INSERT into battery (t0, name, b0, b1, full, unit)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT into battery (t0, name, b0, b1, full, unit, ts0, ts1)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     int(self.last_suspend.strftime("%Y%m%d%H%M%S")),
@@ -194,22 +231,28 @@ class SleepDatabase:
                     None,
                     full,
                     unit,
+                    timestamp,
+                    None,
                 ),
             )
 
-    def record_power_rail_energy(self, label, energy, scale):
+    def record_power_rail_energy(self, label, energy, scale, timestamp=None):
         """Helper function to record power rail energy
 
         Args:
             label: Rail label (e.g., "CPU_VDDCR_PH1_IN_POWER_1")
             energy: Raw energy accumulator value
             scale: Scale factor to convert raw to Joules
+            timestamp: Wall clock time (seconds since the epoch) the energy
+                       was sampled; defaults to now
 
-        First call (prep): INSERT with e0
-        Second call (post): UPDATE with e1
+        First call (before suspend): INSERT with e0/ts0
+        Second call (after resume): UPDATE with e1/ts1
         """
         assert self.db
         assert self.last_suspend
+        if timestamp is None:
+            timestamp = time.time()
         cur = self.db.cursor()
         cur.execute(
             "SELECT e0 FROM power_rails WHERE t0=? AND label=?",
@@ -217,24 +260,30 @@ class SleepDatabase:
         )
         result = cur.fetchone()
         if result is None:
-            # First call (prep): INSERT with e0
+            # First call (before suspend): INSERT with e0
             cur.execute(
                 """
-                INSERT INTO power_rails (t0, label, e0, e1, scale)
-                VALUES (?, ?, ?, NULL, ?)
+                INSERT INTO power_rails (t0, label, e0, e1, scale, ts0, ts1)
+                VALUES (?, ?, ?, NULL, ?, ?, NULL)
                 """,
                 (
                     int(self.last_suspend.strftime("%Y%m%d%H%M%S")),
                     label,
                     energy,
                     scale,
+                    timestamp,
                 ),
             )
         else:
-            # Second call (post): UPDATE with e1
+            # Second call (after resume): UPDATE with e1
             cur.execute(
-                "UPDATE power_rails SET e1=? WHERE t0=? AND label=?",
-                (energy, int(self.last_suspend.strftime("%Y%m%d%H%M%S")), label),
+                "UPDATE power_rails SET e1=?, ts1=? WHERE t0=? AND label=?",
+                (
+                    energy,
+                    timestamp,
+                    int(self.last_suspend.strftime("%Y%m%d%H%M%S")),
+                    label,
+                ),
             )
 
     def record_cycle_data(self, message, symbol) -> None:
@@ -368,7 +417,7 @@ class SleepDatabase:
             t0 = self.last_suspend
         cur = self.db.cursor()
         cur.execute(
-            "SELECT * FROM battery WHERE t0=?",
+            "SELECT t0, name, b0, b1, full, unit, ts0, ts1 FROM battery WHERE t0=?",
             (int(t0.strftime("%Y%m%d%H%M%S")),),
         )
         return cur.fetchall()
@@ -377,7 +426,7 @@ class SleepDatabase:
         """Helper function to report power rails for a given timestamp
 
         Returns:
-            List of tuples: (t0, label, e0, e1, scale)
+            List of tuples: (t0, label, e0, e1, scale, ts0, ts1)
         """
         assert self.db
         if t0 is None:
@@ -385,7 +434,7 @@ class SleepDatabase:
             t0 = self.last_suspend
         cur = self.db.cursor()
         cur.execute(
-            "SELECT * FROM power_rails WHERE t0=?",
+            "SELECT t0, label, e0, e1, scale, ts0, ts1 FROM power_rails WHERE t0=?",
             (int(t0.strftime("%Y%m%d%H%M%S")),),
         )
         return cur.fetchall()
@@ -413,7 +462,7 @@ class SleepDatabase:
 
         pd.set_option("display.precision", 2)
         return pd.read_sql_query(
-            sql="SELECT cycle.t0, cycle.t1, hw, requested, gpio, wake_irq, b0, b1, full FROM cycle LEFT JOIN battery ON cycle.t0 = battery.t0 WHERE cycle.t0 >= ? and cycle.t0 <= ?",
+            sql="SELECT cycle.t0, cycle.t1, hw, requested, gpio, wake_irq, b0, b1, full, battery.ts0 AS ts0, battery.ts1 AS ts1 FROM cycle LEFT JOIN battery ON cycle.t0 = battery.t0 WHERE cycle.t0 >= ? and cycle.t0 <= ?",
             con=self.db,
             params=(
                 int(since.strftime("%Y%m%d%H%M%S")),

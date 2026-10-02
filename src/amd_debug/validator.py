@@ -209,6 +209,16 @@ class SleepValidator(AmdTool):
                     f"Failed to read {rail.label}: {e}", priority=1
                 )
 
+    def capture_energy(self):
+        """Snapshot the battery and power rail energy counters
+
+        This is called immediately before suspending and immediately after
+        resuming so that the energy delta covers as little awake time as
+        possible.
+        """
+        self.capture_battery()
+        self.capture_power_rails()
+
     def check_rtc_cmos(self):
         """Check if the RTC is configured to use ACPI alarm"""
         p = os.path.join(
@@ -867,8 +877,6 @@ class SleepValidator(AmdTool):
             self.check_rtc_cmos,
             self.capture_intel_post,
             self.capture_hw_sleep,
-            self.capture_battery,
-            self.capture_power_rails,
             self.capture_amdgpu_ips_status,
             self.capture_thermal,
             self.capture_input_wakeup_count,
@@ -891,8 +899,6 @@ class SleepValidator(AmdTool):
         self.db.start_cycle(self.last_suspend)
         self.kernel_duration = 0
         self.hw_sleep_duration = 0
-        self.capture_battery()
-        self.capture_power_rails()
         self.check_gpes()
         self.capture_lid()
         self.capture_command_line()
@@ -971,7 +977,7 @@ class SleepValidator(AmdTool):
                     return False
                 intf.Suspend(True)
                 while propf.Get("org.freedesktop.login1.Manager", "PreparingForSleep"):
-                    time.sleep(1)
+                    time.sleep(0.1)
                 return True
             except dbus.exceptions.DBusException as e:
                 self.db.record_cycle_data(
@@ -1066,10 +1072,12 @@ class SleepValidator(AmdTool):
                 "🗣️",
             )
             self.program_wakealarm()
+            self.capture_energy()
             if not self.suspend_system():
                 self.db.sync()
                 self.report_cycle()
                 return False
+            self.capture_energy()
             run_countdown("Collecting data", math.ceil(requested_wait / 2))
             self.post()
             self.db.sync()
@@ -1080,6 +1088,7 @@ class SleepValidator(AmdTool):
     def systemd_pre_hook(self):
         """Called before suspend"""
         self.prep()
+        self.capture_energy()
         self.db.sync()
         toggle_pm_debug(True)
 
@@ -1090,6 +1099,7 @@ class SleepValidator(AmdTool):
         self.last_suspend = datetime.strptime(str(t0[0]), "%Y%m%d%H%M%S")
         self.kernel_log.seek_tail(self.last_suspend)
         self.db.start_cycle(self.last_suspend)
+        self.capture_energy()
         self.post()
         self.db.sync()
 
