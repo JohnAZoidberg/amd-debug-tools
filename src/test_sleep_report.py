@@ -374,7 +374,7 @@ class TestSleepReport(unittest.TestCase):
         self.assertAlmostEqual(self.report.calculate_power_rail_totals(t0, 33), 2.0)
         summary = self.report.format_power_rail_data(t0, 33)
         self.assertIn("(over 30.0s)", summary)
-        self.assertIn("SYS_IN: 2.000W", summary)
+        self.assertIn("SYS_IN: 2000.0mW", summary)
 
         # Rows without snapshot timestamps keep using the cycle duration
         self.mock_db.report_power_rails.return_value = [
@@ -404,9 +404,9 @@ class TestSleepReport(unittest.TestCase):
         self.report.ignore_rails = {"SYS_IN"}
         self.assertAlmostEqual(self.report.calculate_power_rail_totals(t0, 33), 0.6)
         summary = self.report.format_power_rail_data(t0, 33)
-        self.assertIn("SYS_IN: 2.000W (ignored)", summary)
-        self.assertIn("CPU_CORE: 0.500W\n", summary)
-        self.assertIn("Total: 0.600W", summary)
+        self.assertIn("SYS_IN: 2000.0mW (ignored)", summary)
+        self.assertIn("CPU_CORE: 500.0mW\n", summary)
+        self.assertIn("Total: 600.0mW", summary)
 
         # Ignoring every rail leaves nothing to total
         self.report.ignore_rails = {"SYS_IN", "CPU_CORE", "EDP"}

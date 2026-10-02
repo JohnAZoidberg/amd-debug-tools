@@ -419,7 +419,7 @@ class SleepReport(AmdTool):
         rail_lines = []
         total_power = 0.0
         for label, power_w, ignored in rails:
-            line = f"{label}: {power_w:.3f}W"
+            line = f"{label}: {power_w * 1000:.1f}mW"
             if ignored:
                 line += " (ignored)"
             else:
@@ -429,7 +429,7 @@ class SleepReport(AmdTool):
         output = f"\n━━━ Power Rail Consumption (over {t1_seconds:.1f}s) ━━━\n"
         output += "\n".join(rail_lines) + "\n"
         output += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        output += f"Total: {total_power:.3f}W\n"
+        output += f"Total: {total_power * 1000:.1f}mW\n"
 
         return output
 
