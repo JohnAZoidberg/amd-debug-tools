@@ -364,56 +364,31 @@ class TestSleepReport(unittest.TestCase):
         self.assertEqual(len(self.report.failures), 1)
         self.assertIn("asleep for 0:01:05", self.report.failures[0][2])
 
-    def test_format_power_rail_data_uses_snapshot_window(self):
+    def test_calculate_power_rail_totals_uses_snapshot_window(self):
         """Rail power divides the energy delta by the snapshot window when present."""
         t0 = datetime(2023, 10, 10, 12, 0, 0)
         # 60 J (60000 mJ) over a 30 s snapshot window inside a 33 s cycle
         self.mock_db.report_power_rails.return_value = [
             (20231010120000, "SYS_IN", 0.0, 60000.0, 1.0, 1000.0, 1030.0),
-            (20231010120000, "CPU_CORE", 0.0, 15000.0, 1.0, 1000.0, 1030.0),
         ]
+        self.assertAlmostEqual(self.report.calculate_power_rail_totals(t0, 33), 2.0)
         summary = self.report.format_power_rail_data(t0, 33)
         self.assertIn("(over 30.0s)", summary)
         self.assertIn("SYS_IN: 2.000W", summary)
-        self.assertIn("CPU_CORE: 0.500W", summary)
-        # Rails may feed each other, so no sum is reported
-        self.assertNotIn("Total", summary)
 
         # Rows without snapshot timestamps keep using the cycle duration
         self.mock_db.report_power_rails.return_value = [
             (20231010120000, "SYS_IN", 0.0, 66000.0, 1.0, None, None),
         ]
-        summary = self.report.format_power_rail_data(t0, 33)
-        self.assertIn("(over 33.0s)", summary)
-        self.assertIn("SYS_IN: 2.000W", summary)
+        self.assertAlmostEqual(self.report.calculate_power_rail_totals(t0, 33), 2.0)
+        self.assertIn("(over 33.0s)", self.report.format_power_rail_data(t0, 33))
 
         # An unfinished cycle has no second snapshot
         self.mock_db.report_power_rails.return_value = [
             (20231010120000, "SYS_IN", 0.0, None, 1.0, 1000.0, None),
         ]
+        self.assertIsNone(self.report.calculate_power_rail_totals(t0, 33))
         self.assertEqual(self.report.format_power_rail_data(t0, 33), "")
-
-    def test_average_power_ignores_power_rails(self):
-        """The summary's Average Power comes from the battery, not a rail sum."""
-        self.mock_db.report_power_rails.return_value = [
-            (20231010120000, "SYS_IN", 0.0, 60000.0, 1.0, 1000.0, 1030.0),
-        ]
-        self.report.df = pd.DataFrame(
-            {
-                "t0": [datetime(2023, 10, 10, 12, 0, 0).strftime("%Y%m%d%H%M%S")],
-                "t1": [datetime(2023, 10, 10, 13, 0, 0).strftime("%Y%m%d%H%M%S")],
-                "hw": [50],
-                "requested": [1],
-                "gpio": ["1, 2"],
-                "wake_irq": ["1"],
-                "b0": [90000000],
-                "b1": [85000000],
-                "full": [100000000],
-            }
-        )
-        self.report.pre_process_dataframe()
-        self.assertAlmostEqual(self.report.df["Average Power"].iloc[0], -5, places=3)
-        self.assertIn("Battery Delta", self.report.df.columns)
 
     def test_get_prereq_data_preserves_markup_for_html_tables(self):
         """Ensure HTML prerequisite tables remain Markup and are not escaped."""

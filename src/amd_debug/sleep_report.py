@@ -201,6 +201,37 @@ class SleepReport(AmdTool):
                 else:
                     self.failures.append([index, problem, data])
 
+    def calculate_power_rail_totals(self, t0, duration):
+        """Calculate total power from all power rails for a given cycle
+
+        Args:
+            t0: Timestamp of cycle start
+            duration: Duration of cycle in seconds, used when the energy
+                      snapshots don't carry their own timestamps
+
+        Returns:
+            Total power in watts, or None if no valid data
+        """
+        power_rails = self.db.report_power_rails(t0)
+        duration = get_energy_window(power_rails, duration)
+        if not power_rails or not duration or np.isnan(duration):
+            return None
+
+        total_power = 0.0
+        has_valid_data = False
+        for rail_data in power_rails:
+            _t0, label, e0, e1, scale = rail_data[:5]
+            if e0 is None or e1 is None:
+                continue
+
+            # pac194x/5x reports raw*scale in mW-seconds (millijoules)
+            energy_j = (e1 - e0) * scale / 1000.0
+            power_w = energy_j / duration
+            total_power += power_w
+            has_valid_data = True
+
+        return total_power if has_valid_data else None
+
     def pre_process_dataframe(self):
         """Pre-process the pandas dataframe"""
         self.df["Duration"] = self.df["t1"].apply(format_as_seconds) - self.df[
@@ -219,11 +250,18 @@ class SleepReport(AmdTool):
             window = snapshot_window.where(snapshot_window > 0, window)
         self.df["Hardware Sleep"] = (self.df["hw"] / window).apply(parse_hw_sleep)
 
-        # Average power comes from the battery. Power rails are reported
-        # individually in the debug data: they are not guaranteed to be
-        # independent (one may feed the others), so summing them would
-        # double count.
-        if not self.df["b0"].isnull().all():
+        # Calculate power rail totals for each cycle
+        power_rail_totals = []
+        for t0, duration in zip(self.df["t0"], self.df["Duration"]):
+            cycle_t0 = format_as_human(t0)
+            total_power = self.calculate_power_rail_totals(cycle_t0, duration)
+            power_rail_totals.append(total_power)
+
+        # Use power rail data if available, otherwise fall back to battery
+        has_power_rails = any(p is not None for p in power_rail_totals)
+        if has_power_rails:
+            self.df["Average Power"] = power_rail_totals
+        elif not self.df["b0"].isnull().all():
             self.df["Battery Start"] = self.df["b0"] / self.df["full"] * 100
             self.df["Battery Delta"] = (
                 (self.df["b1"] - self.df["b0"]) / self.df["full"] * 100
@@ -339,6 +377,7 @@ class SleepReport(AmdTool):
 
         # Build rail list first to check if we have any valid data
         rail_lines = []
+        total_power = 0.0
         for rail_data in power_rails:
             _t0, label, e0, e1, scale = rail_data[:5]
             if e0 is None or e1 is None or not t1_seconds or np.isnan(t1_seconds):
@@ -347,6 +386,7 @@ class SleepReport(AmdTool):
             # pac194x/5x reports raw*scale in mW-seconds (millijoules), so
             energy_j = (e1 - e0) * scale / 1000.0
             power_w = energy_j / t1_seconds
+            total_power += power_w
 
             rail_lines.append(f"{label}: {power_w:.3f}W")
 
@@ -356,6 +396,8 @@ class SleepReport(AmdTool):
 
         output = f"\n━━━ Power Rail Consumption (over {t1_seconds:.1f}s) ━━━\n"
         output += "\n".join(rail_lines) + "\n"
+        output += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        output += f"Total: {total_power:.3f}W\n"
 
         return output
 
