@@ -440,6 +440,11 @@ class LowHardwareSleepResidency(S0i3Failure):
     """System had low hardware sleep residency"""
 
     def __init__(self, duration, percent):
+        """
+        Args:
+            duration: Length of the sleep window as a timedelta
+            percent: Fraction (0.0 - 1.0) of the window spent in hardware sleep
+        """
         super().__init__()
         self.description = "System had low hardware sleep residency"
         self.explanation = (

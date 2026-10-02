@@ -9,6 +9,7 @@ from unittest.mock import patch, call
 
 import logging
 import unittest
+from datetime import timedelta
 import os
 
 import amd_debug.failures
@@ -102,10 +103,13 @@ class TestFailures(unittest.TestCase):
         self.assertEqual(
             cls.get_description(), "Userspace wasn't asleep at least 0:00:01"
         )
-        cls = amd_debug.failures.LowHardwareSleepResidency(5, 30)
+        cls = amd_debug.failures.LowHardwareSleepResidency(
+            timedelta(seconds=65), 0.8615
+        )
         self.assertEqual(
             cls.get_description(), "System had low hardware sleep residency"
         )
+        self.assertIn("asleep for 0:01:05, but only spent 86.15%", str(cls))
         cls = amd_debug.failures.MSRFailure()
         self.assertEqual(cls.get_description(), "PC6 or CC6 state disabled")
         cls = amd_debug.failures.TaintedKernel()

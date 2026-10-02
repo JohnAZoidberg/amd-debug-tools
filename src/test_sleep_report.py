@@ -163,6 +163,22 @@ class TestSleepReport(unittest.TestCase):
         )
         self.assertEqual(len(self.report.failures), 2)
 
+    def test_analyze_duration_residency_text(self):
+        """The residency failure reports the duration and percent sensibly."""
+        self.report.failures = []
+        self.report.analyze_duration(
+            index=0,
+            t0=datetime(2023, 10, 10, 12, 0, 0),
+            t1=datetime(2023, 10, 10, 12, 1, 5),
+            requested=60,
+            hw=86.15,
+        )
+        self.assertEqual(len(self.report.failures), 1)
+        text = self.report.failures[0][2]
+        self.assertIn("asleep for 0:01:05", text)
+        self.assertIn("86.15%", text)
+        self.assertNotIn("8615", text)
+
     @patch("amd_debug.sleep_report.Environment")
     @patch("amd_debug.sleep_report.FileSystemLoader")
     def test_build_template(self, _mock_fsl, mock_env):
